@@ -42,7 +42,7 @@ using namespace std;
 
 enum class Tok {
     IDENT, NUMBER, STRING,
-    LPAREN, RPAREN, LBRACE, RBRACE, COMMA,
+    LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET, COMMA,
     EQ, EQEQ, NEQ, GT, LT, GE, LE,
     PLUS, MINUS, STAR, SLASH, PERCENT,
     NEWLINE, END
@@ -90,6 +90,8 @@ static vector<Token> tokenize(const string& src) {
         if (c == ')') { out.push_back({Tok::RPAREN, ")"}); i++; continue; }
         if (c == '{') { out.push_back({Tok::LBRACE, "{"}); i++; continue; }
         if (c == '}') { out.push_back({Tok::RBRACE, "}"}); i++; continue; }
+        if (c == '[') { out.push_back({Tok::LBRACKET, "["}); i++; continue; }
+        if (c == ']') { out.push_back({Tok::RBRACKET, "]"}); i++; continue; }
         if (c == ',') { out.push_back({Tok::COMMA, ","}); i++; continue; }
         if (c == '=' && i + 1 < n && src[i+1] == '=') { out.push_back({Tok::EQEQ, "=="}); i += 2; continue; }
         if (c == '!' && i + 1 < n && src[i+1] == '=') { out.push_back({Tok::NEQ, "!="}); i += 2; continue; }
@@ -113,17 +115,17 @@ static vector<Token> tokenize(const string& src) {
 
 // ===================== AST =====================
 
-enum class ExprKind { NUMBER, STRING, IDENT, BINOP, UNARY, CALL };
+enum class ExprKind { NUMBER, STRING, IDENT, BINOP, UNARY, CALL, ARRAY, INDEX };
 
 struct Expr {
     ExprKind kind;
     double num = 0;
     string str;                    // string literal / ident name / op text / callee name
-    unique_ptr<Expr> left, right;  // BINOP operands; UNARY uses left
-    vector<unique_ptr<Expr>> args; // CALL arguments
+    unique_ptr<Expr> left, right;  // BINOP operands; UNARY uses left; INDEX: left=base, right=index
+    vector<unique_ptr<Expr>> args; // CALL arguments / ARRAY literal elements
 };
 
-enum class StmtKind { PRT, INPUT, ASSIGN, IF, WHILE, FUNC, RETURN, BREAK, CONTINUE, CALLSTMT };
+enum class StmtKind { PRT, INPUT, ASSIGN, IF, WHILE, FUNC, RETURN, BREAK, CONTINUE, CALLSTMT, INDEXSET };
 
 struct Stmt;
 struct IfBranch {
@@ -141,6 +143,8 @@ struct Stmt {
     unique_ptr<Expr> cond;              // WHILE condition
     vector<unique_ptr<Stmt>> body;      // WHILE body / FUNC body
     vector<string> params;              // FUNC parameters
+    unique_ptr<Expr> indexTarget;       // INDEXSET: base array (always an IDENT expr)
+    unique_ptr<Expr> indexExpr;         // INDEXSET: index expression
 };
 
 using Program = vector<unique_ptr<Stmt>>;
@@ -196,6 +200,19 @@ struct Parser {
             advance();
             e = parseExpr();
             if (cur().type == Tok::RPAREN) advance();
+        } else if (cur().type == Tok::LBRACKET) {   // array literal: [expr, expr, ...]
+            advance();
+            e->kind = ExprKind::ARRAY;
+            skipNewlines();
+            if (cur().type != Tok::RBRACKET) {
+                for (;;) {
+                    e->args.push_back(parseExpr());
+                    if (cur().type == Tok::COMMA) { advance(); skipNewlines(); continue; }
+                    break;
+                }
+            }
+            skipNewlines();
+            if (cur().type == Tok::RBRACKET) advance();
         } else if (cur().type == Tok::IDENT) {
             string name = cur().text;
             advance();
@@ -220,6 +237,20 @@ struct Parser {
             // Nothing recognizable; produce an empty string literal so
             // callers still get a well-formed (if useless) Expr node.
             e->kind = ExprKind::STRING; e->str = "";
+        }
+        // Single-level indexing: `expr[index]`. Not chained (no `a[i][j]` in
+        // one go) -- index into a nested array with a temporary instead. That
+        // keeps the assignment side (which only ever targets `IDENT[index]`)
+        // symmetric with what reads can do.
+        if (cur().type == Tok::LBRACKET) {
+            advance();
+            auto idx = parseExpr();
+            if (cur().type == Tok::RBRACKET) advance();
+            auto ie = make_unique<Expr>();
+            ie->kind = ExprKind::INDEX;
+            ie->left = std::move(e);
+            ie->right = std::move(idx);
+            e = std::move(ie);
         }
         return e;
     }
@@ -274,7 +305,7 @@ struct Parser {
         }
     }
 
-    unique_ptr<Expr> parseExpr() {
+    unique_ptr<Expr> parseComparison() {
         auto left = parseAdditive();
         for (;;) {
             string op;
@@ -290,6 +321,27 @@ struct Parser {
             advance();
             left = makeBinop(op, std::move(left), parseAdditive());
         }
+    }
+
+    // 'and' binds tighter than 'or', both looser than comparison -- matches
+    // the usual boolean-operator precedence so `a == b or c and d` parses as
+    // `(a == b) or (c and d)` without needing parentheses.
+    unique_ptr<Expr> parseAnd() {
+        auto left = parseComparison();
+        while (isIdent("and")) {
+            advance();
+            left = makeBinop("and", std::move(left), parseComparison());
+        }
+        return left;
+    }
+
+    unique_ptr<Expr> parseExpr() {
+        auto left = parseAnd();
+        while (isIdent("or")) {
+            advance();
+            left = makeBinop("or", std::move(left), parseAnd());
+        }
+        return left;
     }
 
     // Skip an unrecognized statement's tokens (legacy no-op compatibility).
@@ -412,6 +464,30 @@ struct Parser {
             s->kind = StmtKind::INPUT;
             if (cur().type == Tok::IDENT) { s->name = cur().text; advance(); }
             return s;
+        }
+
+        if (cur().type == Tok::IDENT && toks[pos + 1].type == Tok::LBRACKET) {
+            size_t save = pos;
+            string base = cur().text;
+            advance(); // ident
+            advance(); // '['
+            auto idxExpr = parseExpr();
+            if (cur().type == Tok::RBRACKET) advance();
+            if (cur().type == Tok::EQ) {
+                advance();
+                auto s = make_unique<Stmt>();
+                s->kind = StmtKind::INDEXSET;
+                auto tgt = make_unique<Expr>();
+                tgt->kind = ExprKind::IDENT;
+                tgt->str = base;
+                s->indexTarget = std::move(tgt);
+                s->indexExpr = std::move(idxExpr);
+                s->expr = parseExpr();
+                return s;
+            }
+            // Not an assignment (e.g. a bare `arr[i]` statement, which has no
+            // effect) -- rewind and let the generic fallback skip it.
+            pos = save;
         }
 
         if (cur().type == Tok::IDENT && toks[pos + 1].type == Tok::EQ) {
@@ -582,9 +658,21 @@ struct Interpreter {
                 return callFunction(e->str, args);
             }
             case ExprKind::BINOP: {
+                const string& op = e->str;
+                // Short-circuit: the right operand must not be evaluated at
+                // all when the left already decides the result, matching
+                // what the codegen's branches do.
+                if (op == "and" || op == "or") {
+                    Value left = evalExpr(e->left.get());
+                    bool lt = truthy(left);
+                    Value result;
+                    result.type = ValueType::BOOL;
+                    if (op == "and" ? !lt : lt) { result.b_val = lt; return result; }
+                    result.b_val = truthy(evalExpr(e->right.get()));
+                    return result;
+                }
                 Value left = evalExpr(e->left.get());
                 Value right = evalExpr(e->right.get());
-                const string& op = e->str;
                 if (isArith(op)) return evalArith(op, left, right);
                 Value result;
                 result.type = ValueType::BOOL;
@@ -832,6 +920,10 @@ struct CodeGen {
                 return;
             }
             case ExprKind::BINOP: {
+                if (e->str == "and" || e->str == "or") {
+                    genShortCircuit(e);
+                    return;
+                }
                 int t = genAndHold(e->left.get());
                 genExpr(e->right.get());
                 *text << "    mov %rax, %rdx\n";     // right -> arg3
@@ -846,6 +938,30 @@ struct CodeGen {
                 return;
             }
         }
+    }
+
+    // 'and'/'or' must not evaluate their right operand when the left already
+    // decides the result -- that's the entire point of the feature, not just
+    // an optimization, so this is branches rather than a runtime call.
+    // Leaves a Value* (built via rt_make_bool) in %rax, like any other genExpr.
+    void genShortCircuit(const Expr* e) {
+        bool isAnd = e->str == "and";
+        string trueLbl = newLabel("Lbtrue");
+        string falseLbl = newLabel("Lbfalse");
+        string done = newLabel("Lbend");
+        genCondition(e->left.get());                // test %eax, %eax <- truthy(left)
+        // 'and' with a falsy left, or 'or' with a truthy left, already knows
+        // the answer and must not touch the right operand at all.
+        *text << "    " << (isAnd ? "je" : "jne") << " " << (isAnd ? falseLbl : trueLbl) << "\n";
+        genCondition(e->right.get());
+        *text << "    je " << falseLbl << "\n";
+        *text << "    jmp " << trueLbl << "\n";
+        *text << falseLbl << ":\n";
+        *text << "    mov $0, %edi\n    call rt_make_bool\n";
+        *text << "    jmp " << done << "\n";
+        *text << trueLbl << ":\n";
+        *text << "    mov $1, %edi\n    call rt_make_bool\n";
+        *text << done << ":\n";
     }
 
     void genCall(const Expr* e) {
@@ -1052,6 +1168,7 @@ struct CodeGen {
             << "    .extern rt_neg\n"
             << "    .extern rt_undef\n"
             << "    .extern rt_truthy\n"
+            << "    .extern rt_make_bool\n"
             << "    .section .rodata\n"
             << rodata.str()
             << "    .section .bss\n"

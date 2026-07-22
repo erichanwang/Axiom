@@ -1,0 +1,36 @@
+# 'and' / 'or' with short-circuit evaluation, plus 'else if' chains.
+
+func sideEffect(tag, ret) {
+  prt "eval " + tag
+  return ret
+}
+
+# Right side must not run when the left already decides the result.
+prt sideEffect("and-left-false", 0) and sideEffect("and-right", 1)
+prt sideEffect("and-left-true", 1) and sideEffect("and-right2", 0)
+prt sideEffect("or-left-true", 1) or sideEffect("or-right", 0)
+prt sideEffect("or-left-false", 0) or sideEffect("or-right2", 1)
+
+# Precedence: 'and' binds tighter than 'or'; comparisons bind tighter than both.
+a = 5
+b = 0
+prt a > 0 and b == 0
+prt a > 0 and b != 0 or a == 5
+prt (a > 0 and b != 0) or a == 5
+
+# Chained and/or, and non-numeric operands (strings/EMPTY are always falsy).
+prt 1 and 2 and 3
+prt 0 or 0 or 5
+prt "" and 1
+prt "x" or 1
+
+x = 10
+if (x == 1) {
+  prt "one"
+} else if (x == 2) {
+  prt "two"
+} else if (x == 10) {
+  prt "ten"
+} else {
+  prt "other"
+}

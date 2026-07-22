@@ -58,6 +58,13 @@ Value* rt_make_str(const char* s) {
     return v;
 }
 
+Value* rt_make_bool(int b) {
+    Value* v = alloc_value();
+    v->type = VT_BOOL;
+    v->num = b ? 1 : 0;
+    return v;
+}
+
 Value* rt_make_err(const char* msg) {
     Value* v = alloc_value();
     v->type = VT_ERROR;

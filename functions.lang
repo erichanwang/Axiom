@@ -1,0 +1,56 @@
+# Functions: parameters, return values, recursion.
+
+func add(a, b) {
+  return a + b
+}
+
+func square(x) {
+  return x * x
+}
+
+# Recursion, the real test of per-call stack frames.
+func factorial(n) {
+  if (n <= 1) {
+    return 1
+  }
+  return n * factorial(n - 1)
+}
+
+func fib(n) {
+  if (n < 2) {
+    return n
+  }
+  return fib(n - 1) + fib(n - 2)
+}
+
+# No explicit return: falls off the end and yields EMPTY.
+func shout(word) {
+  prt word + "!"
+}
+
+# Locals shadow globals rather than clobbering them.
+counter = 100
+func uses_local() {
+  counter = 7
+  return counter
+}
+
+prt add(2, 3)
+prt square(5)
+prt factorial(6)
+prt fib(10)
+
+# Nested and composed calls.
+prt add(square(3), square(4))
+prt add(add(1, 2), add(3, 4))
+
+shout("hello")
+
+prt uses_local()
+prt counter
+
+# Six arguments: the full System V register-argument set.
+func six(a, b, c, d, e, f) {
+  return a + b + c + d + e + f
+}
+prt six(1, 2, 3, 4, 5, 6)

@@ -1,40 +1,60 @@
 # Language Syntax and Rules
 
+## Comments
+- A '#' begins a comment that runs to the end of the line.
+
 ## Variables
 - Variables are declared and assigned using the '=' operator.
-- The 'let' keyword is not required.
+- The 'let' keyword is not required and is not recognized.
 - Variable names should not contain spaces.
 - Example:
   x = 10
   message = "Hello, World!"
 
 ## Data Types
-- The language currently supports Numbers and Strings.
+- The language supports Numbers and Strings.
 - Types are inferred from the assigned value.
+- Numbers are doubles and print with six decimal places.
 - String literals must be enclosed in double quotes.
+
+## Arithmetic
+- Operators: + - * / %
+- Standard precedence: * / % bind tighter than + -, and both bind tighter
+  than the comparison operators. Parentheses override precedence.
+- Unary minus negates a number: y = -x
+- '+' adds when both operands are numbers, and concatenates otherwise:
+  prt "count: " + 42     # prints  count: 42.000000
+- Division or modulo by zero produces an error value rather than crashing or
+  producing NaN. It prints as "ERROR: division by zero" and propagates through
+  any further arithmetic.
+- Arithmetic on a non-number produces "ERROR: non-numeric operand".
+- Example:
+  a = 2 + 3 * 4          # 14
+  b = (2 + 3) * 4        # 20
+  c = 17 % 5             # 2
 
 ## Output
 - The 'prt' command is used to print values to the console.
-- It can print string literals or the value of a variable.
+- It can print a literal, a variable, or any expression.
 - Example:
   prt "This is a message."
-  my_variable = "some value"
-  prt my_variable
+  prt x * 2 + 1
 
 ## Input
-- The 'input' command is used to get input from the user and store it in a variable.
+- The 'input' command reads a line from the user into a variable.
 - The value is always stored as a string.
 - Example:
   prt "What is your name?"
   input user_name
-  prt "Hello, "
-  prt user_name
+  prt "Hello, " + user_name
 
 ## Conditional Logic
 - 'if', 'else if', and 'else' statements are supported for conditional execution.
 - Conditions must be enclosed in parentheses ().
 - Code blocks for each condition must be enclosed in curly braces {}.
 - Supported comparison operators: ==, !=, >, <, >=, <=
+- A condition is true when it is a true comparison or a non-zero number.
+  Strings and empty values are never true.
 - Example:
   x = 10
   if (x > 5) {
@@ -44,3 +64,39 @@
   } else {
     prt "x is less than 5"
   }
+
+## Loops
+- 'while' repeats a block for as long as its condition holds.
+- 'break' exits the innermost loop; 'continue' skips to its next iteration.
+- Example:
+  i = 0
+  while (i < 5) {
+    if (i == 3) {
+      break
+    }
+    prt i
+    i = i + 1
+  }
+
+## Functions
+- Declared with 'func', a name, a parenthesized parameter list, and a block.
+- 'return' returns a value; falling off the end returns an empty value.
+- Functions may be called before the line that declares them.
+- Recursion is supported: each call gets its own stack frame.
+- At most six parameters, matching the six System V register arguments the
+  code generator uses.
+- Parameters and any variable assigned inside a function body are local to
+  that call, and shadow a global of the same name rather than overwriting it.
+- Example:
+  func factorial(n) {
+    if (n <= 1) {
+      return 1
+    }
+    return n * factorial(n - 1)
+  }
+  prt factorial(6)       # 720.000000
+
+## Unrecognized statements
+- Any statement that does not match one of the forms above is silently
+  skipped. This preserves the original interpreter's behavior for lines like
+  'let x = 10' or 'print x', which are not part of the language.

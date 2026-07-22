@@ -1,0 +1,49 @@
+# Arithmetic, operator precedence, parentheses, unary minus.
+a = 2 + 3 * 4
+prt a
+
+b = (2 + 3) * 4
+prt b
+
+c = 10 - 2 - 3
+prt c
+
+d = 100 / 5 / 2
+prt d
+
+e = 17 % 5
+prt e
+
+f = -7 + 2
+prt f
+
+g = -(3 * 4)
+prt g
+
+h = 2 * -3
+prt h
+
+# Precedence across a comparison: arithmetic binds tighter than ==
+if (2 + 3 * 4 == 14) {
+  prt "precedence ok"
+} else {
+  prt "precedence broken"
+}
+
+# Deep nesting, past the 5-register temp pool, to exercise the stack-spill path.
+deep = 1 + (2 * (3 + (4 * (5 + (6 * (7 + (8 * (9 + 10))))))))
+prt deep
+
+# '+' concatenates when either side is not a number.
+msg = "count: " + 42
+prt msg
+
+# Division by zero is a defined error value, not a crash or a NaN.
+bad = 1 / 0
+prt bad
+
+worse = 5 % 0
+prt worse
+
+# An error propagates through further arithmetic.
+prt bad + 1

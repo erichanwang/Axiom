@@ -1,0 +1,47 @@
+# while loops, break, continue.
+i = 0
+while (i < 5) {
+  prt i
+  i = i + 1
+}
+
+# Accumulate a sum.
+total = 0
+n = 1
+while (n <= 10) {
+  total = total + n
+  n = n + 1
+}
+prt total
+
+# break exits the innermost loop.
+k = 0
+while (k < 100) {
+  if (k == 3) {
+    break
+  }
+  prt k
+  k = k + 1
+}
+prt "after break"
+
+# continue skips the rest of the body. Note the counter advances before it.
+m = 0
+while (m < 6) {
+  m = m + 1
+  if (m % 2 == 0) {
+    continue
+  }
+  prt m
+}
+
+# Nested loops: a small multiplication table.
+row = 1
+while (row <= 3) {
+  col = 1
+  while (col <= 3) {
+    prt row * col
+    col = col + 1
+  }
+  row = row + 1
+}

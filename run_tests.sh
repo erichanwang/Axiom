@@ -19,7 +19,7 @@ for f in *.lang; do
     "$BUILD/compiler" --interpret "$f" < "$stdin_file" > "$BUILD/$name.interp.out" 2>&1
 
     "$BUILD/compiler" --compile "$f" -o "$BUILD/$name.s" 2>/dev/null
-    gcc -no-pie "$BUILD/$name.s" runtime.c -o "$BUILD/$name.bin" 2>"$BUILD/$name.cc.err"
+    gcc -no-pie "$BUILD/$name.s" runtime.c -lm -o "$BUILD/$name.bin" 2>"$BUILD/$name.cc.err"
     if [ $? -ne 0 ]; then
         echo "FAIL (assemble/link): $f"
         cat "$BUILD/$name.cc.err"

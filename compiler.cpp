@@ -800,9 +800,25 @@ struct CodeGen {
                 if (it != localSlots.end()) {
                     *text << "    mov " << it->second << "(%rbp), %rax\n";
                 } else {
-                    declareVar(e->str); // reading before writing: 0 == uninitialized (rt_* handles null)
+                    declareVar(e->str);
                     *text << "    mov var_" << e->str << "(%rip), %rax\n";
                 }
+                // An unassigned slot is a null Value*. The interpreter reports
+                // that as an error and carries on, so the compiled path has to
+                // do the same. Letting the null reach rt_arith instead makes
+                // '+' stringify it, so "prt undefined + 1" printed "EMPTY1.000000"
+                // where the interpreter printed an error. Both backends agreeing
+                // is the whole point of run_tests.sh, and no .lang file in the
+                // corpus happened to read an unassigned name, so the differential
+                // suite never caught it.
+                string lbl = ".LCund" + std::to_string(litCounter);
+                string ok = ".Ldef" + std::to_string(litCounter++);
+                rodata << lbl << ": .string \"" << escapeAsm(e->str) << "\"\n";
+                *text << "    test %rax, %rax\n";
+                *text << "    jne " << ok << "\n";
+                *text << "    lea " << lbl << "(%rip), %rdi\n";
+                *text << "    call rt_undef\n";
+                *text << ok << ":\n";
                 return;
             }
             case ExprKind::UNARY: {
@@ -1034,6 +1050,7 @@ struct CodeGen {
             << "    .extern rt_cmp\n"
             << "    .extern rt_arith\n"
             << "    .extern rt_neg\n"
+            << "    .extern rt_undef\n"
             << "    .extern rt_truthy\n"
             << "    .section .rodata\n"
             << rodata.str()

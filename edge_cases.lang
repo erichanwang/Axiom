@@ -1,0 +1,48 @@
+# Cases where the compiled backend has an inline fast path and the
+# interpreter does not, so the two are most likely to drift apart.
+# run_tests.sh diffs both backends on this file.
+
+# Non-commutative operators: a swapped operand still yields a plausible
+# number, so these have to be checked by value and not by eye.
+a = 10
+b = 3
+prt a - b
+prt b - a
+prt a / b
+prt b / a
+prt 100 - 20 - 5
+prt 100 / 10 / 2
+prt a - b * 2
+prt (a - b) * 2
+
+# Signs and zero.
+prt 0 - 7
+prt -5 - -3
+prt 0 - 0
+
+# The inline path must defer to the runtime here rather than emit an IEEE
+# infinity or a NaN.
+prt 1 / 0
+prt 0 / 0
+prt 7 % 0
+prt 10 % 3
+
+# '+' concatenates unless both operands are numbers, so it can never be
+# specialized to addsd without checking the tags first.
+prt "a" + "b"
+prt "n=" + 5
+prt 5 + "n"
+
+# Reading a name that was never assigned. This has to report an error, not
+# stringify the empty slot into the output.
+prt undefined_var + 1
+prt 1 + undefined_var
+prt undefined_var - undefined_var
+
+# Nesting past the five-register temp pool, forcing spills to the stack.
+prt ((1 + 2) * (3 + 4)) - ((5 + 6) * (7 + 8)) + ((9 + 1) * (2 + 3)) - ((4 + 5) * (6 + 7))
+
+# Magnitudes that leave the range where doubles are exact.
+x = 1000000
+prt x * x * x * x
+prt 1 / 3 * 3

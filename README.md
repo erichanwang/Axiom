@@ -79,7 +79,7 @@ than crashing or silently yielding NaN.
   Allocation follows the evaluation stack's shape, and expressions nested
   deeper than the pool fall back to stack spilling, so correctness never
   depends on the pool's size. Measured effect: **10.1% fewer emitted
-  instructions** across the corpus (1720 -> 1545). Pass `--no-regalloc` to
+  instructions** across the corpus (2692 -> 2434). Pass `--no-regalloc` to
   turn it off and reproduce both figures.
 
 The generated assembly links against `runtime.c`, a small C runtime
@@ -121,6 +121,22 @@ register pool, loops with `break`/`continue`, recursion (`factorial`, `fib`),
 nested calls, six-argument calls, local-vs-global shadowing, FizzBuzz, and
 trial-division primes.
 
+`edge_cases.lang` exists because the gate is only as good as the corpus, and
+this one had a hole in it. It covers the cases where the two backends are
+most likely to drift: operand order for the non-commutative operators,
+division and modulo by zero, `+` concatenating rather than adding, reading a
+name that was never assigned, nesting past the register pool, and magnitudes
+where doubles stop being exact.
+
+Adding it caught a real divergence. Reading an unassigned name left a null
+`Value*` that reached `rt_arith`, which stringified it, so the compiled
+`prt undefined_var + 1` printed `EMPTY1.000000` while the interpreter
+reported `Unknown identifier: 'undefined_var'`. Both backends had behaved
+that way from the start; no program in the corpus happened to read an
+unassigned name, so nothing ever noticed. Identifier reads now check for the
+empty slot and call `rt_undef`, which builds the same error value the
+interpreter does.
+
 ## Benchmarks
 
 ```sh
@@ -132,15 +148,31 @@ primes below 4000), best of five runs:
 
 | Backend | Time |
 |---|---|
-| Tree-walking interpreter | 103 ms |
-| Compiled x86-64 | 46 ms |
-| **Speedup** | **2.2x** |
+| Tree-walking interpreter | 58 ms |
+| Compiled x86-64 | 19 ms |
+| **Speedup** | **3.0x** |
 
 The compiled path is faster because control flow, variable access, and the
-calling convention are all native. It is 2.2x rather than 20x because every
-value is still a heap-allocated `Value*` built through a runtime call, so
-allocation dominates. Unboxing numbers into registers is the obvious next
-step and is not implemented.
+calling convention are all native.
+
+It used to be 2.0x, and the reason it was not higher turned out not to be the
+code being generated at all. Every intermediate value is a heap-allocated
+`Value*`, and each one came from a `calloc`. Nothing in this language ever
+frees a Value: there is no destructor, no reference count, and no collector,
+so every Value produced during a run lives until the process exits. That
+makes `calloc`'s free-list bookkeeping pure overhead, all of it paid for a
+free that never comes. Replacing it with a bump allocator over 1 MiB chunks
+(`alloc_value` in `runtime.c`) took the compiled workload from 29 ms to 19 ms
+on the same machine under the same load.
+
+A second attempt did not pan out, which is worth recording. Arithmetic was
+also given an inline type-specialized fast path: rather than calling
+`rt_arith`, the generated code checked both operand tags inline and, in the
+common two-numbers case, emitted `addsd`/`subsd`/`mulsd`/`divsd` directly.
+Measured against the arena allocator alone, it was worth 0 ms, so it was
+removed rather than kept as unearned complexity. Allocation, not call
+overhead, was the whole cost. Unboxing numbers so arithmetic does not
+allocate at all is the remaining step, and it is not implemented.
 
 `benchmark.sh` verifies that both backends produce identical output before
 timing anything, so a speedup can never come from the compiled path doing

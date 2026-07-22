@@ -14,8 +14,34 @@ typedef struct {
     char* str;
 } Value;
 
+// Values are never individually freed: the language has no destructor, no
+// reference count, and no collector, so every Value produced during a run
+// lives until the process exits. That makes a bump allocator exactly
+// equivalent to calloc here, minus the free-list bookkeeping malloc does for
+// a free that never comes. Arithmetic allocates a Value per intermediate
+// result, so this sits directly under the hottest loop in any program.
+#define ARENA_CHUNK (1u << 20)
+static char* arena_next = NULL;
+static size_t arena_left = 0;
+
 static Value* alloc_value(void) {
-    return (Value*)calloc(1, sizeof(Value));
+    if (arena_left < sizeof(Value)) {
+        arena_next = (char*)malloc(ARENA_CHUNK);
+        if (!arena_next) {
+            fprintf(stderr, "out of memory\n");
+            exit(1);
+        }
+        arena_left = ARENA_CHUNK;
+    }
+    Value* v = (Value*)arena_next;
+    // sizeof(Value) is a multiple of 8 and malloc hands back 16-aligned
+    // blocks, so bumping by it keeps every Value aligned for its double.
+    arena_next += sizeof(Value);
+    arena_left -= sizeof(Value);
+    v->type = 0;      // matches calloc: VT_STRING is 0, overwritten by callers
+    v->num = 0;
+    v->str = NULL;
+    return v;
 }
 
 Value* rt_make_num(double n) {
@@ -130,6 +156,17 @@ Value* rt_arith(int op, Value* left, Value* right) {
         default: r->num = fmod(left->num, right->num); break;
     }
     return r;
+}
+
+// Reading a name that was never assigned. The interpreter reports this and
+// keeps going, so the compiled path has to produce the same error value
+// rather than treat the empty slot as a usable operand: a null Value* used to
+// fall through to rt_arith, which stringified it and quietly concatenated
+// "EMPTY" into the output instead of failing.
+Value* rt_undef(const char* name) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "Unknown identifier: '%s'", name ? name : "");
+    return rt_make_err(buf);
 }
 
 Value* rt_neg(Value* v) {

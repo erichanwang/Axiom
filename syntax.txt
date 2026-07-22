@@ -12,10 +12,13 @@
   message = "Hello, World!"
 
 ## Data Types
-- The language supports Numbers and Strings.
+- The language supports Numbers, Strings, and Arrays (see the Arrays section
+  below).
 - Types are inferred from the assigned value.
 - Numbers are doubles and print with six decimal places.
 - String literals must be enclosed in double quotes.
+- Printing an array prints "[" + each element (formatted the same way it
+  would print on its own) joined by ", " + "]", e.g. [1.000000, 2.000000].
 
 ## Arithmetic
 - Operators: + - * / %
@@ -77,6 +80,45 @@
     prt i
     i = i + 1
   }
+
+## Arrays
+- Literal syntax: '[expr, expr, ...]', e.g. a = [1, 2, 3].
+- Indexing: 'arr[index]' reads an element. Indexing is a single level only --
+  'grid[0][1]' does not parse as chained indexing. To index into a nested
+  array, assign the inner array to a temporary first:
+    row = grid[1]
+    prt row[0]
+- Assignment to an index: 'arr[index] = expr'. The target must be a plain
+  variable name (not another index expression).
+- 'len(arr)' returns the element count as a number. 'len' is a reserved
+  builtin name and cannot be declared as a user function.
+- Arrays are heap objects with reference semantics, like every other Value
+  in this language's runtime: assigning an array to another variable, or
+  passing it as a function argument, aliases the same backing storage --
+  it does not copy the elements. Mutating an index through one name is
+  visible through every other name bound to the same array.
+- Index semantics (the interpreter and the codegen agree on this exactly):
+  - An index is only valid if it is a Number. A non-numeric index (a string,
+    an array, an error, ...) is treated as invalid.
+  - A valid index truncates toward zero (7.9 becomes 7, -0.5 becomes 0),
+    the same as a C '(long)' cast on the double.
+  - Reading ('prt arr[i]', or using it in an expression) with an
+    out-of-bounds index (negative after truncation, or >= the array's
+    length), a non-numeric index, or indexing something that isn't an
+    array, produces the same "ERROR: ..." value that other invalid
+    operations in this language produce (e.g. division by zero).
+  - Writing ('arr[i] = v') with any of those same invalid conditions is a
+    silent no-op: the index expression and the value expression are still
+    evaluated (so a function call used as either one still runs and can
+    still print), but no store happens and nothing is reported.
+- Example:
+  a = [10, 20, 30]
+  prt a[0]           # 10.000000
+  prt len(a)         # 3.000000
+  a[1] = 99
+  prt a              # [10.000000, 99.000000, 30.000000]
+  prt a[10]          # ERROR: index out of bounds
+  a[10] = 1          # no-op, a is unchanged
 
 ## Functions
 - Declared with 'func', a name, a parenthesized parameter list, and a block.

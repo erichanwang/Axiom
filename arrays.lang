@@ -1,0 +1,53 @@
+# Basic array literal, indexing, length, and index assignment.
+a = [10, 20, 30]
+prt a
+prt a[0]
+prt a[1]
+prt a[2]
+prt len(a)
+
+a[1] = 99
+prt a
+
+# Aliasing: arrays are reference types, so a second name bound to the same
+# array sees mutations made through the first.
+b = a
+b[0] = 1
+prt a
+prt b
+
+# Arrays as function arguments alias the caller's array too.
+func setFirst(arr, v) {
+  arr[0] = v
+}
+setFirst(a, 777)
+prt a
+
+# len() works inside a loop condition, and the element sum over it.
+func sum(arr) {
+  total = 0
+  i = 0
+  while (i < len(arr)) {
+    total = total + arr[i]
+    i = i + 1
+  }
+  return total
+}
+prt sum([1, 2, 3, 4, 5])
+
+# Nested arrays: no chained indexing (grid[0][1] doesn't parse as one
+# expression), so read the row into a temporary first.
+grid = [[1, 2], [3, 4]]
+prt grid
+row = grid[1]
+prt row[0]
+prt row[1]
+
+# Index expressions, not just literals.
+i = 2
+prt a[i - 1]
+
+# Empty array.
+empty = []
+prt empty
+prt len(empty)

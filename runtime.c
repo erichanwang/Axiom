@@ -6,12 +6,14 @@
 #include <string.h>
 #include <math.h>
 
-typedef enum { VT_STRING, VT_NUMBER, VT_BOOL, VT_EMPTY, VT_ERROR } ValueType;
+typedef enum { VT_STRING, VT_NUMBER, VT_BOOL, VT_EMPTY, VT_ERROR, VT_ARRAY } ValueType;
 
-typedef struct {
+typedef struct Value {
     ValueType type;
     double num;
     char* str;
+    struct Value** arr;   // VT_ARRAY: element slots
+    long arr_len;         // VT_ARRAY: element count
 } Value;
 
 // Values are never individually freed: the language has no destructor, no
@@ -41,6 +43,8 @@ static Value* alloc_value(void) {
     v->type = 0;      // matches calloc: VT_STRING is 0, overwritten by callers
     v->num = 0;
     v->str = NULL;
+    v->arr = NULL;
+    v->arr_len = 0;
     return v;
 }
 
@@ -72,6 +76,37 @@ Value* rt_make_err(const char* msg) {
     return v;
 }
 
+static const char* value_to_string(Value* v, char* buf, size_t bufsize);
+
+// Appends `s` to a growable heap buffer, doubling capacity as needed.
+static void str_append(char** buf, size_t* cap, size_t* len, const char* s) {
+    size_t slen = strlen(s);
+    if (*len + slen + 1 > *cap) {
+        while (*len + slen + 1 > *cap) *cap *= 2;
+        *buf = (char*)realloc(*buf, *cap);
+    }
+    strcpy(*buf + *len, s);
+    *len += slen;
+}
+
+// Builds "[e0, e1, ...]", recursing into value_to_string per element so
+// nested arrays print the same way the interpreter's Value::to_string does.
+// The returned buffer is never freed -- consistent with every other Value
+// payload in this runtime, which lives until the process exits.
+static char* array_to_string(Value* v) {
+    size_t cap = 64, len = 0;
+    char* out = (char*)malloc(cap);
+    out[0] = '\0';
+    str_append(&out, &cap, &len, "[");
+    for (long i = 0; i < v->arr_len; i++) {
+        if (i) str_append(&out, &cap, &len, ", ");
+        char buf[256];
+        str_append(&out, &cap, &len, value_to_string(v->arr[i], buf, sizeof(buf)));
+    }
+    str_append(&out, &cap, &len, "]");
+    return out;
+}
+
 static const char* value_to_string(Value* v, char* buf, size_t bufsize) {
     if (!v) return "EMPTY";
     switch (v->type) {
@@ -79,6 +114,7 @@ static const char* value_to_string(Value* v, char* buf, size_t bufsize) {
         case VT_NUMBER: snprintf(buf, bufsize, "%.6f", v->num); return buf;
         case VT_BOOL: return v->num != 0 ? "true" : "false";
         case VT_ERROR: snprintf(buf, bufsize, "ERROR: %s", v->str ? v->str : ""); return buf;
+        case VT_ARRAY: return array_to_string(v);
         default: return "EMPTY";
     }
 }
@@ -180,6 +216,60 @@ Value* rt_neg(Value* v) {
     if (v && v->type == VT_ERROR) return v;
     if (!v || v->type != VT_NUMBER) return rt_make_err("non-numeric operand");
     return rt_make_num(-v->num);
+}
+
+// --- Arrays --------------------------------------------------------------
+// Semantics (must match Interpreter::arrayIndex / execStmt INDEXSET exactly,
+// see compiler.cpp and syntax.txt):
+//   - Indices truncate toward zero via a C (long) cast, same as the
+//     interpreter's (long) cast on the same double.
+//   - Reading with a negative or too-large index, or a non-numeric index,
+//     or indexing a non-array, produces an ERROR value.
+//   - Writing (arr[i] = v) to an invalid index or through a non-array is a
+//     silent no-op: the index and value expressions still evaluate (so any
+//     side effects, e.g. a call that prints, still happen), only the store
+//     itself is skipped.
+
+// Allocates an array of `n` slots, all initially NULL. Construction always
+// fills every slot immediately afterward (rt_array_set_elem), so a NULL slot
+// is never observed by rt_array_get in a running program.
+Value* rt_array_new(long n) {
+    Value* v = alloc_value();
+    v->type = VT_ARRAY;
+    v->arr_len = n;
+    v->arr = n > 0 ? (Value**)malloc(n * sizeof(Value*)) : NULL;
+    for (long i = 0; i < n; i++) v->arr[i] = NULL;
+    return v;
+}
+
+// Raw slot store used only during array-literal construction: the index is
+// compiler-generated and always in bounds, so no validation here.
+void rt_array_set_elem(Value* arr, long idx, Value* val) {
+    if (arr && arr->arr && idx >= 0 && idx < arr->arr_len) arr->arr[idx] = val;
+}
+
+Value* rt_array_get(Value* arr, Value* idx) {
+    if (arr && arr->type == VT_ERROR) return arr;
+    if (idx && idx->type == VT_ERROR) return idx;
+    if (!arr || arr->type != VT_ARRAY) return rt_make_err("not an array");
+    if (!idx || idx->type != VT_NUMBER) return rt_make_err("non-numeric index");
+    long i = (long)idx->num;
+    if (i < 0 || i >= arr->arr_len) return rt_make_err("index out of bounds");
+    return arr->arr[i];
+}
+
+void rt_array_set(Value* arr, Value* idx, Value* val) {
+    if (!arr || arr->type != VT_ARRAY) return;      // not an array: no-op
+    if (!idx || idx->type != VT_NUMBER) return;      // non-numeric index: no-op
+    long i = (long)idx->num;
+    if (i < 0 || i >= arr->arr_len) return;          // out of bounds: no-op
+    arr->arr[i] = val;
+}
+
+Value* rt_array_len(Value* arr) {
+    if (arr && arr->type == VT_ERROR) return arr;
+    if (!arr || arr->type != VT_ARRAY) return rt_make_err("not an array");
+    return rt_make_num((double)arr->arr_len);
 }
 
 int rt_truthy(Value* v) {

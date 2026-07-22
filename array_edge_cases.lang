@@ -1,0 +1,48 @@
+# Array edge cases in the spirit of edge_cases.lang: places where the
+# compiled fast path and the interpreter's generic path could disagree.
+a = [1, 2, 3]
+
+# Out-of-bounds reads, both directions.
+prt a[3]
+prt a[100]
+prt a[-1]
+prt a[-100]
+
+# Non-integer indices truncate toward zero rather than rounding or erroring.
+prt a[1.9]
+prt a[1.1]
+prt a[-0.5]
+prt a[-0.9]
+
+# Indexing something that isn't an array.
+x = 5
+prt x[0]
+s = "hello"
+prt s[0]
+
+# Indexing/len with a value that is itself an error, so the error must
+# propagate rather than being masked by an "index out of bounds" or
+# "not an array" message.
+prt a[1 / 0]
+prt a[undefined_name]
+prt len(undefined_name)
+prt len(x)
+
+# Out-of-bounds / invalid writes are no-ops, but the index and value
+# expressions must still be evaluated for their side effects.
+func loud(n) {
+  prt "evaluated " + n
+  return n
+}
+a[100] = loud(1)
+prt a
+a[-1] = loud(2)
+prt a
+x[0] = loud(3)
+prt x
+a["k"] = loud(4)
+prt a
+
+# A valid write after all those no-ops still works normally.
+a[0] = loud(5)
+prt a

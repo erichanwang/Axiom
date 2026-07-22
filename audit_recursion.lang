@@ -1,0 +1,8 @@
+func descend(n) {
+  if (n <= 0) {
+    return 0
+  }
+  return descend(n - 1)
+}
+
+prt descend(10000)

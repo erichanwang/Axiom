@@ -1,0 +1,11 @@
+func seven(a, b, c, d, e, f, g) {
+  prt a
+  prt b
+  prt c
+  prt d
+  prt e
+  prt f
+  prt g
+}
+
+seven(1, 2, 3, 4, 5, 6, 7)

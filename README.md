@@ -1,9 +1,10 @@
 # Axiom
 
 A custom language with a hand-written lexer, recursive-descent parser, and
-AST, executed either by a tree-walking interpreter or by a native x86-64
-code generator. Both backends run from the same AST, and the test suite
-diffs them against each other on every program in the repo.
+AST, executed by three independent backends: a tree-walking interpreter, a
+stack-based bytecode VM, and a native x86-64 code generator. All three run
+from the same AST, and the test suite diffs their output against each other
+on every program in the repo.
 
 ## Language
 
@@ -53,7 +54,17 @@ than crashing or silently yielding NaN.
    re-parsing of strings at runtime. Function calls push a frame; `break`,
    `continue`, and `return` unwind through a `Flow` result rather than
    exceptions.
-4. **Codegen** (`CodeGen`). Walks the same AST and emits x86-64 GAS
+4. **Bytecode VM** (`VMCompiler` + `VM`). Compiles the AST once into a flat
+   instruction stream per function (`VChunk`) and runs it on a stack
+   machine. This is a structurally different execution model from the
+   interpreter, not the same logic in new clothes: `if`/`while` bodies
+   become jump targets resolved at compile time, `break`/`continue` become
+   plain `JMP`s instead of a threaded `Flow` value, and `return` pops a call
+   frame instead of unwinding through recursive C++ calls. Arithmetic,
+   comparison, truthiness, and array indexing are each re-derived
+   independently rather than shared with `Interpreter` or `runtime.c`, so a
+   bug has to survive three unrelated implementations to pass the diff.
+5. **Codegen** (`CodeGen`). Walks the same AST and emits x86-64 GAS
    assembly.
 
 ### What the code generator actually does
@@ -99,6 +110,9 @@ g++ -O2 -std=c++17 -o compiler compiler.cpp
 # Interpret (default, no flag needed):
 ./compiler program.lang
 
+# Run on the bytecode VM:
+./compiler --vm program.lang
+
 # Compile to x86-64 assembly, then assemble/link/run it:
 ./compiler --compile program.lang -o program.s
 gcc -no-pie program.s runtime.c -lm -o program
@@ -107,10 +121,11 @@ gcc -no-pie program.s runtime.c -lm -o program
 
 ## Testing
 
-`run_tests.sh` runs every `*.lang` file through both the interpreter and the
-compiled x86-64 binary and diffs their output, failing if the two disagree.
-This differential check is the project's main correctness gate: a codegen bug
-that the interpreter does not share shows up immediately as a diff.
+`run_tests.sh` runs every `*.lang` file through the interpreter, the bytecode
+VM, and the compiled x86-64 binary, and diffs all three outputs against the
+interpreter's. This differential check is the project's main correctness
+gate: a bug in the VM or the codegen that the interpreter does not share
+shows up immediately as a diff.
 
 ```sh
 ./run_tests.sh
@@ -144,16 +159,23 @@ interpreter does.
 ```
 
 Measured on `bench/workload.lang` (recursive `fib(21)` plus trial-division
-primes below 4000), best of five runs:
+primes below 4000), best of nine runs:
 
 | Backend | Time |
 |---|---|
-| Tree-walking interpreter | 58 ms |
-| Compiled x86-64 | 19 ms |
-| **Speedup** | **3.0x** |
+| Tree-walking interpreter | 89 ms |
+| Bytecode VM | 88 ms |
+| Compiled x86-64 | 30 ms |
+| **Speedup, interpreter to x86-64** | **2.9x** |
+| **Speedup, VM to x86-64** | **2.9x** |
 
 The compiled path is faster because control flow, variable access, and the
-calling convention are all native.
+calling convention are all native. The VM comes out roughly even with the
+tree-walking interpreter here rather than clearly ahead: both look up every
+variable by name through a `map<string, Value>` frame, and that string-keyed
+lookup is what a `fib(21)`-heavy workload spends most of its time on, so
+trading AST recursion for instruction dispatch does not move the needle
+until variables are resolved to slot indices instead of names.
 
 It used to be 2.0x, and the reason it was not higher turned out not to be the
 code being generated at all. Every intermediate value is a heap-allocated

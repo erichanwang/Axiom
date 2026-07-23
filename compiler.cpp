@@ -824,6 +824,401 @@ struct Interpreter {
     }
 };
 
+// ===================== Bytecode VM =====================
+// A third, independent execution path: the AST is compiled to a flat
+// instruction stream per function (chunk 0 is top-level code) and run on a
+// stack machine. break/continue/return, which the tree-walker threads
+// through as a Flow enum, become plain jumps and a call-stack pop here --
+// that difference in mechanism is exactly what makes this a real third
+// implementation rather than the interpreter with extra steps, and why the
+// differential suite gets sharper by including it. Arithmetic, comparison,
+// truthiness, and array indexing are deliberately re-derived (not shared
+// with Interpreter or the runtime) so a bug in one path has to also exist
+// independently in the others to survive the diff.
+
+enum class VOp {
+    PUSH_NUM, PUSH_STR, PUSH_EMPTY, LOAD, STORE, POP, DUP, CONV_BOOL, NEG,
+    ARITH, CMP, ARRAY_NEW, INDEX_GET, INDEX_SET, JMP, JZ, CALL, LEN, PRT,
+    INPUT, RETURN
+};
+
+struct VInstr {
+    VOp op;
+    double num = 0;
+    string str;   // name / op text
+    int a = 0;    // jump target index / arg count / array element count
+};
+
+using VChunk = vector<VInstr>;
+
+struct VMCompiler {
+    vector<VChunk> chunks;            // chunks[0] = top-level program
+    vector<set<string>> chunkLocals;  // per-chunk local-name sets
+    vector<vector<string>> chunkParams;
+    map<string, int> funcIndex;       // function name -> chunk index
+
+    // Loop context for break/continue: continueTarget is the index of the
+    // condition re-check; breakPatches collects JMP sites to fix up to the
+    // loop's end once it is known.
+    struct LoopCtx { int continueTarget; vector<int>* breakPatches; };
+    vector<LoopCtx> loopStack;
+
+    static int emit(VChunk& c, VOp op, double num = 0, const string& str = "", int a = 0) {
+        c.push_back({op, num, str, a});
+        return (int)c.size() - 1;
+    }
+
+    void compileExpr(const Expr* e, VChunk& c) {
+        switch (e->kind) {
+            case ExprKind::NUMBER: emit(c, VOp::PUSH_NUM, e->num); return;
+            case ExprKind::STRING: emit(c, VOp::PUSH_STR, 0, e->str); return;
+            case ExprKind::IDENT:  emit(c, VOp::LOAD, 0, e->str); return;
+            case ExprKind::UNARY:
+                compileExpr(e->left.get(), c);
+                emit(c, VOp::NEG);
+                return;
+            case ExprKind::ARRAY:
+                for (auto& a : e->args) compileExpr(a.get(), c);
+                emit(c, VOp::ARRAY_NEW, 0, "", (int)e->args.size());
+                return;
+            case ExprKind::INDEX:
+                compileExpr(e->left.get(), c);
+                compileExpr(e->right.get(), c);
+                emit(c, VOp::INDEX_GET);
+                return;
+            case ExprKind::CALL:
+                if (e->str == "len" && e->args.size() == 1) {
+                    compileExpr(e->args[0].get(), c);
+                    emit(c, VOp::LEN);
+                    return;
+                }
+                for (auto& a : e->args) compileExpr(a.get(), c);
+                emit(c, VOp::CALL, 0, e->str, (int)e->args.size());
+                return;
+            case ExprKind::BINOP: {
+                const string& op = e->str;
+                if (op == "and" || op == "or") {
+                    // Short-circuit: convert the left side to bool, then
+                    // either keep it (it already decides the result) or
+                    // discard it and fall through to the right side,
+                    // matching Interpreter::evalExpr's "and"/"or" arm.
+                    compileExpr(e->left.get(), c);
+                    emit(c, VOp::CONV_BOOL);
+                    emit(c, VOp::DUP);
+                    // "and" skips the right side when the left is false;
+                    // "or" skips it when the left is true. JZ only tests
+                    // falsy, so "or" needs its sense inverted.
+                    int skipRight = op == "and" ? emit(c, VOp::JZ) : -1;
+                    int doRight = op == "or" ? emit(c, VOp::JZ) : -1;
+                    int jumpOverRight = -1;
+                    if (op == "or") jumpOverRight = emit(c, VOp::JMP);
+                    if (op == "or") c[doRight].a = (int)c.size();
+                    emit(c, VOp::POP);
+                    compileExpr(e->right.get(), c);
+                    emit(c, VOp::CONV_BOOL);
+                    int end = (int)c.size();
+                    if (op == "and") c[skipRight].a = end;
+                    if (op == "or") c[jumpOverRight].a = end;
+                    return;
+                }
+                compileExpr(e->left.get(), c);
+                compileExpr(e->right.get(), c);
+                if (isArith(op)) emit(c, VOp::ARITH, 0, op);
+                else emit(c, VOp::CMP, 0, op);
+                return;
+            }
+        }
+    }
+
+    void compileStmt(const Stmt* s, VChunk& c) {
+        switch (s->kind) {
+            case StmtKind::FUNC: return; // hoisted separately
+            case StmtKind::PRT:
+                compileExpr(s->expr.get(), c);
+                emit(c, VOp::PRT);
+                return;
+            case StmtKind::INPUT:
+                emit(c, VOp::INPUT, 0, s->name);
+                return;
+            case StmtKind::ASSIGN:
+                compileExpr(s->expr.get(), c);
+                emit(c, VOp::STORE, 0, s->name);
+                return;
+            case StmtKind::CALLSTMT:
+                compileExpr(s->expr.get(), c);
+                emit(c, VOp::POP);
+                return;
+            case StmtKind::RETURN:
+                if (s->expr) compileExpr(s->expr.get(), c);
+                else emit(c, VOp::PUSH_EMPTY);
+                emit(c, VOp::RETURN);
+                return;
+            case StmtKind::BREAK:
+                if (!loopStack.empty()) {
+                    int j = emit(c, VOp::JMP);
+                    loopStack.back().breakPatches->push_back(j);
+                }
+                return;
+            case StmtKind::CONTINUE:
+                if (!loopStack.empty()) emit(c, VOp::JMP, 0, "", loopStack.back().continueTarget);
+                return;
+            case StmtKind::INDEXSET:
+                compileExpr(s->indexExpr.get(), c);
+                compileExpr(s->expr.get(), c);
+                emit(c, VOp::INDEX_SET, 0, s->indexTarget->str);
+                return;
+            case StmtKind::WHILE: {
+                int condStart = (int)c.size();
+                compileExpr(s->cond.get(), c);
+                int exitJump = emit(c, VOp::JZ);
+                vector<int> breaks;
+                loopStack.push_back({condStart, &breaks});
+                for (auto& body : s->body) compileStmt(body.get(), c);
+                loopStack.pop_back();
+                emit(c, VOp::JMP, 0, "", condStart);
+                int end = (int)c.size();
+                c[exitJump].a = end;
+                for (int b : breaks) c[b].a = end;
+                return;
+            }
+            case StmtKind::IF: {
+                vector<int> toEnd;
+                for (auto& branch : s->branches) {
+                    compileExpr(branch.cond.get(), c);
+                    int skip = emit(c, VOp::JZ);
+                    for (auto& body : branch.body) compileStmt(body.get(), c);
+                    toEnd.push_back(emit(c, VOp::JMP));
+                    c[skip].a = (int)c.size();
+                }
+                if (s->hasElse)
+                    for (auto& body : s->elseBody) compileStmt(body.get(), c);
+                int end = (int)c.size();
+                for (int j : toEnd) c[j].a = end;
+                return;
+            }
+        }
+    }
+
+    void compileChunk(const vector<unique_ptr<Stmt>>& body, VChunk& c) {
+        for (auto& s : body) compileStmt(s.get(), c);
+    }
+
+    // Mirrors Interpreter::run's hoist-then-execute shape: every FUNC gets
+    // its own chunk and local-name set before any chunk body is compiled, so
+    // forward references and recursion both resolve.
+    void compile(const Program& prog) {
+        chunks.emplace_back();          // chunk 0: top level
+        chunkLocals.emplace_back();
+        chunkParams.emplace_back();
+
+        for (auto& s : prog) {
+            if (s->kind == StmtKind::FUNC) {
+                int idx = (int)chunks.size();
+                funcIndex[s->name] = idx;
+                chunks.emplace_back();
+                set<string> locals;
+                for (const string& l : functionLocals(s.get())) locals.insert(l);
+                chunkLocals.push_back(locals);
+                chunkParams.push_back(s->params);
+            }
+        }
+        for (auto& s : prog) {
+            if (s->kind == StmtKind::FUNC) compileChunk(s->body, chunks[funcIndex[s->name]]);
+        }
+        compileChunk(prog, chunks[0]);
+    }
+};
+
+struct VM {
+    vector<VChunk> chunks;
+    vector<set<string>> chunkLocals;
+    vector<vector<string>> chunkParams;
+    map<string, int> funcIndex;
+
+    map<string, Value> globals;
+    vector<Value> stack;
+
+    struct Frame { int chunkId; size_t ip; map<string, Value> locals; };
+    vector<Frame> callStack;
+
+    static Value makeErr(const string& msg) {
+        Value v; v.type = ValueType::ERROR; v.s_val = msg; return v;
+    }
+
+    // Independent re-derivation of Interpreter::truthy.
+    static bool vmTruthy(const Value& v) {
+        if (v.type == ValueType::BOOL) return v.b_val;
+        if (v.type == ValueType::NUMBER) return v.n_val != 0;
+        return false;
+    }
+
+    // Independent re-derivation of Interpreter::evalArith.
+    static Value vmArith(const string& op, const Value& l, const Value& r) {
+        if (l.type == ValueType::ERROR) return l;
+        if (r.type == ValueType::ERROR) return r;
+        bool bothNum = l.type == ValueType::NUMBER && r.type == ValueType::NUMBER;
+        if (op == "+" && !bothNum) {
+            Value out; out.type = ValueType::STRING;
+            out.s_val = l.to_string() + r.to_string();
+            return out;
+        }
+        if (!bothNum) return makeErr("non-numeric operand");
+        Value out; out.type = ValueType::NUMBER;
+        if (op == "+") out.n_val = l.n_val + r.n_val;
+        else if (op == "-") out.n_val = l.n_val - r.n_val;
+        else if (op == "*") out.n_val = l.n_val * r.n_val;
+        else {
+            if (r.n_val == 0) return makeErr("division by zero");
+            out.n_val = (op == "/") ? l.n_val / r.n_val : fmod(l.n_val, r.n_val);
+        }
+        return out;
+    }
+
+    // Independent re-derivation of Interpreter::evalExpr's comparison arm.
+    static Value vmCompare(const string& op, const Value& l, const Value& r) {
+        Value out; out.type = ValueType::BOOL;
+        if (op == "==") {
+            if (l.type == ValueType::NUMBER && r.type == ValueType::NUMBER) out.b_val = l.n_val == r.n_val;
+            else out.b_val = l.to_string() == r.to_string();
+        } else if (op == "!=") {
+            if (l.type == ValueType::NUMBER && r.type == ValueType::NUMBER) out.b_val = l.n_val != r.n_val;
+            else out.b_val = l.to_string() != r.to_string();
+        } else if (op == ">")  out.b_val = l.n_val > r.n_val;
+        else if (op == "<")  out.b_val = l.n_val < r.n_val;
+        else if (op == ">=") out.b_val = l.n_val >= r.n_val;
+        else if (op == "<=") out.b_val = l.n_val <= r.n_val;
+        return out;
+    }
+
+    // Independent re-derivation of Interpreter::arrayIndex.
+    static Value vmArrayIndex(const Value& base, const Value& idx) {
+        if (base.type == ValueType::ERROR) return base;
+        if (idx.type == ValueType::ERROR) return idx;
+        if (base.type != ValueType::ARRAY) return makeErr("not an array");
+        if (idx.type != ValueType::NUMBER) return makeErr("non-numeric index");
+        long i = (long)idx.n_val;
+        if (i < 0 || i >= (long)base.arr_val->size()) return makeErr("index out of bounds");
+        return (*base.arr_val)[i];
+    }
+
+    Value* lookup(const string& name) {
+        Frame& f = callStack.back();
+        if (chunkLocals[f.chunkId].count(name)) {
+            auto it = f.locals.find(name);
+            return it == f.locals.end() ? nullptr : &it->second;
+        }
+        auto it = globals.find(name);
+        return it == globals.end() ? nullptr : &it->second;
+    }
+
+    void store(const string& name, const Value& v) {
+        Frame& f = callStack.back();
+        if (chunkLocals[f.chunkId].count(name)) f.locals[name] = v;
+        else globals[name] = v;
+    }
+
+    Value pop() { Value v = stack.back(); stack.pop_back(); return v; }
+
+    void doReturn(Value v) {
+        callStack.pop_back();
+        stack.push_back(v);
+    }
+
+    void run(const VMCompiler& compiled) {
+        chunks = compiled.chunks;
+        chunkLocals = compiled.chunkLocals;
+        chunkParams = compiled.chunkParams;
+        funcIndex = compiled.funcIndex;
+        callStack.push_back({0, 0, {}});
+
+        while (true) {
+            Frame& f = callStack.back();
+            if (f.ip >= chunks[f.chunkId].size()) {
+                if (callStack.size() == 1) break;      // top-level program finished
+                doReturn(Value{});                      // fell off the end of a function
+                continue;
+            }
+            const VInstr& in = chunks[f.chunkId][f.ip++];
+            switch (in.op) {
+                case VOp::PUSH_NUM: { Value v; v.type = ValueType::NUMBER; v.n_val = in.num; stack.push_back(v); break; }
+                case VOp::PUSH_STR: { Value v; v.type = ValueType::STRING; v.s_val = in.str; stack.push_back(v); break; }
+                case VOp::PUSH_EMPTY: stack.push_back(Value{}); break;
+                case VOp::LOAD: {
+                    Value* found = lookup(in.str);
+                    stack.push_back(found ? *found : makeErr("Unknown identifier: '" + in.str + "'"));
+                    break;
+                }
+                case VOp::STORE: store(in.str, pop()); break;
+                case VOp::POP: pop(); break;
+                case VOp::DUP: stack.push_back(stack.back()); break;
+                case VOp::CONV_BOOL: {
+                    Value v = pop();
+                    Value out; out.type = ValueType::BOOL; out.b_val = vmTruthy(v);
+                    stack.push_back(out);
+                    break;
+                }
+                case VOp::NEG: {
+                    Value v = pop();
+                    if (v.type == ValueType::ERROR) { stack.push_back(v); break; }
+                    if (v.type != ValueType::NUMBER) { stack.push_back(makeErr("non-numeric operand")); break; }
+                    Value out; out.type = ValueType::NUMBER; out.n_val = -v.n_val;
+                    stack.push_back(out);
+                    break;
+                }
+                case VOp::ARITH: { Value r = pop(), l = pop(); stack.push_back(vmArith(in.str, l, r)); break; }
+                case VOp::CMP:   { Value r = pop(), l = pop(); stack.push_back(vmCompare(in.str, l, r)); break; }
+                case VOp::ARRAY_NEW: {
+                    Value v; v.type = ValueType::ARRAY; v.arr_val = make_shared<vector<Value>>(in.a);
+                    for (int i = in.a - 1; i >= 0; i--) (*v.arr_val)[i] = pop();
+                    stack.push_back(v);
+                    break;
+                }
+                case VOp::INDEX_GET: { Value idx = pop(), base = pop(); stack.push_back(vmArrayIndex(base, idx)); break; }
+                case VOp::INDEX_SET: {
+                    Value val = pop(), idxv = pop();
+                    Value* target = lookup(in.str);
+                    if (target && target->type == ValueType::ARRAY && idxv.type == ValueType::NUMBER) {
+                        long i = (long)idxv.n_val;
+                        if (i >= 0 && i < (long)target->arr_val->size()) (*target->arr_val)[i] = val;
+                    }
+                    break;
+                }
+                case VOp::JMP: f.ip = in.a; break;
+                case VOp::JZ: if (!vmTruthy(pop())) f.ip = in.a; break;
+                case VOp::LEN: {
+                    Value arg = pop();
+                    if (arg.type == ValueType::ERROR) { stack.push_back(arg); break; }
+                    if (arg.type != ValueType::ARRAY) { stack.push_back(makeErr("not an array")); break; }
+                    Value out; out.type = ValueType::NUMBER; out.n_val = (double)arg.arr_val->size();
+                    stack.push_back(out);
+                    break;
+                }
+                case VOp::CALL: {
+                    auto it = funcIndex.find(in.str);
+                    vector<Value> args(in.a);
+                    for (int i = in.a - 1; i >= 0; i--) args[i] = pop();
+                    if (it == funcIndex.end()) { stack.push_back(makeErr("Unknown function: '" + in.str + "'")); break; }
+                    Frame nf; nf.chunkId = it->second; nf.ip = 0;
+                    auto& params = chunkParams[it->second];
+                    for (size_t i = 0; i < params.size(); i++)
+                        nf.locals[params[i]] = i < args.size() ? args[i] : Value{};
+                    callStack.push_back(std::move(nf));
+                    break;
+                }
+                case VOp::PRT: cout << pop().to_string() << "\n"; break;
+                case VOp::INPUT: {
+                    string line;
+                    getline(cin, line);
+                    Value v; v.type = ValueType::STRING; v.s_val = line;
+                    store(in.str, v);
+                    break;
+                }
+                case VOp::RETURN: doReturn(pop()); break;
+            }
+        }
+    }
+};
+
 // ===================== x86-64 code generator =====================
 // Emits GAS (AT&T) assembly. Values are heap-allocated Value* handles built
 // and inspected through a small C runtime (runtime.c) -- the same way a real
@@ -1308,13 +1703,15 @@ static string readFile(const string& path) {
 
 int main(int argc, char* argv[]) {
     vector<string> args(argv + 1, argv + argc);
-    bool compileMode = false;
+    enum class Mode { INTERPRET, COMPILE, VM };
+    Mode mode = Mode::INTERPRET;
     bool regalloc = true;
     string srcPath, outPath;
 
     for (size_t i = 0; i < args.size(); i++) {
-        if (args[i] == "--compile") compileMode = true;
-        else if (args[i] == "--interpret") compileMode = false;
+        if (args[i] == "--compile") mode = Mode::COMPILE;
+        else if (args[i] == "--interpret") mode = Mode::INTERPRET;
+        else if (args[i] == "--vm") mode = Mode::VM;
         else if (args[i] == "--no-regalloc") regalloc = false;
         else if (args[i] == "-o" && i + 1 < args.size()) outPath = args[++i];
         else if (srcPath.empty()) srcPath = args[i];
@@ -1322,7 +1719,7 @@ int main(int argc, char* argv[]) {
 
     if (srcPath.empty()) {
         cerr << "Usage: " << argv[0]
-             << " [--interpret|--compile] [--no-regalloc] <source_file.lang> [-o output.s]" << endl;
+             << " [--interpret|--vm|--compile] [--no-regalloc] <source_file.lang> [-o output.s]" << endl;
         return 1;
     }
 
@@ -1338,7 +1735,7 @@ int main(int argc, char* argv[]) {
     Parser parser(tokens);
     Program prog = parser.parseProgram();
 
-    if (compileMode) {
+    if (mode == Mode::COMPILE) {
         if (outPath.empty()) outPath = srcPath + ".s";
         CodeGen cg;
         cg.regallocEnabled = regalloc;
@@ -1347,6 +1744,14 @@ int main(int argc, char* argv[]) {
         out << asmOut;
         out.close();
         cerr << "Wrote assembly to " << outPath << endl;
+        return 0;
+    }
+
+    if (mode == Mode::VM) {
+        VMCompiler vc;
+        vc.compile(prog);
+        VM vm;
+        vm.run(vc);
         return 0;
     }
 

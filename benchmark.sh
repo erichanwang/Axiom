@@ -1,7 +1,8 @@
 #!/bin/bash
-# Two measurements, both reproducible from a clean checkout:
+# Three measurements, all reproducible from a clean checkout:
 #
-#   1. Compiled x86-64 vs the tree-walking interpreter, on bench/workload.lang.
+#   1. Compiled x86-64 vs the tree-walking interpreter vs the bytecode VM,
+#      on bench/workload.lang.
 #   2. Emitted instruction count with the register pool on vs off
 #      (--no-regalloc), over the whole .lang corpus.
 #
@@ -22,7 +23,13 @@ gcc -no-pie -O2 "$BUILD/workload.s" runtime.c -lm -o "$BUILD/workload.bin" || ex
 
 # Sanity check before timing: a fast wrong answer is not a speedup.
 "$BUILD/compiler" --interpret bench/workload.lang > "$BUILD/interp.out"
+"$BUILD/compiler" --vm bench/workload.lang > "$BUILD/vm.out"
 "$BUILD/workload.bin" > "$BUILD/comp.out"
+if ! diff -q "$BUILD/interp.out" "$BUILD/vm.out" > /dev/null; then
+    echo "ABORT: interpreter and vm disagree on the benchmark workload"
+    diff "$BUILD/interp.out" "$BUILD/vm.out"
+    exit 1
+fi
 if ! diff -q "$BUILD/interp.out" "$BUILD/comp.out" > /dev/null; then
     echo "ABORT: backends disagree on the benchmark workload"
     diff "$BUILD/interp.out" "$BUILD/comp.out"
@@ -43,14 +50,18 @@ best() {
 }
 
 interp_ms=$(best "$BUILD/compiler" --interpret bench/workload.lang)
+vm_ms=$(best "$BUILD/compiler" --vm bench/workload.lang)
 comp_ms=$(best "$BUILD/workload.bin")
 
 echo "=== Execution: bench/workload.lang (best of $REPS) ==="
 printf "  tree-walking interpreter : %6d ms\n" "$interp_ms"
+printf "  bytecode vm              : %6d ms\n" "$vm_ms"
 printf "  compiled x86-64          : %6d ms\n" "$comp_ms"
 if [ "$comp_ms" -gt 0 ]; then
-    printf "  speedup                  : %sx\n" \
+    printf "  speedup (interp/x86)    : %sx\n" \
         "$(echo "scale=1; $interp_ms / $comp_ms" | bc)"
+    printf "  speedup (vm/x86)        : %sx\n" \
+        "$(echo "scale=1; $vm_ms / $comp_ms" | bc)"
 else
     echo "  speedup                  : compiled run too fast to time at ms resolution"
 fi

@@ -1,0 +1,1 @@
+2026-07-22: Added a bytecode VM as a third execution path (tree-walk interpreter, bytecode VM, native x86-64), all three diffed against each other by run_tests.sh on every .lang program. Benchmark (bench/workload.lang, best of 9): interpreter 89ms, VM 88ms, x86-64 30ms.

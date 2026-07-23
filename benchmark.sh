@@ -5,6 +5,8 @@
 #      on bench/workload.lang.
 #   2. Emitted instruction count with the register pool on vs off
 #      (--no-regalloc), over the whole .lang corpus.
+#   3. Emitted instruction count with the peephole pass on vs off
+#      (--no-peephole), over the whole .lang corpus.
 #
 # Every number quoted in README.md comes from running this script.
 set -u
@@ -85,3 +87,13 @@ printf "  stack-spill temporaries  : %6d\n" "$without"
 printf "  register-pool temporaries: %6d\n" "$with"
 printf "  reduction                : %s%%\n" \
     "$(echo "scale=1; 100 * ($without - $with) / $without" | bc)"
+
+# --- 3. peephole pass on vs off -------------------------------------------
+peep_without=$(count_instructions "--no-peephole")
+
+echo
+echo "=== Codegen: emitted instructions, peephole pass on vs off ==="
+printf "  before peephole          : %6d\n" "$peep_without"
+printf "  after peephole           : %6d\n" "$with"
+printf "  reduction                : %s%%\n" \
+    "$(echo "scale=2; 100 * ($peep_without - $with) / $peep_without" | bc)"

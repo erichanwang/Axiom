@@ -89,9 +89,20 @@ than crashing or silently yielding NaN.
   because they survive the runtime calls the right operand will make.
   Allocation follows the evaluation stack's shape, and expressions nested
   deeper than the pool fall back to stack spilling, so correctness never
-  depends on the pool's size. Measured effect: **10.1% fewer emitted
-  instructions** across the corpus (2692 -> 2434). Pass `--no-regalloc` to
+  depends on the pool's size. Measured effect: **9.6% fewer emitted
+  instructions** across the corpus (4184 -> 3782). Pass `--no-regalloc` to
   turn it off and reproduce both figures.
+- **A peephole pass over the emitted assembly.** Two local, always-safe
+  cleanups applied to the finished instruction stream: an unconditional
+  `jmp` immediately followed by another `jmp` makes the second one dead code
+  (nothing can jump into the middle of two adjacent lines, so it is always
+  removable), and `mov A, B` immediately followed by `mov B, A` reloads a
+  value that is already sitting where it is being loaded to. Measured
+  effect: **0.96% fewer emitted instructions** across the corpus (3819 ->
+  3782). Small, because the codegen and register pool already avoid most of
+  what a peephole pass would otherwise clean up; the two patterns above are
+  what is actually left over. Pass `--no-peephole` to turn it off and
+  reproduce both figures.
 
 The generated assembly links against `runtime.c`, a small C runtime
 implementing the tagged `Value` type (string, number, bool, empty, error),
@@ -163,11 +174,11 @@ primes below 4000), best of nine runs:
 
 | Backend | Time |
 |---|---|
-| Tree-walking interpreter | 89 ms |
-| Bytecode VM | 88 ms |
-| Compiled x86-64 | 30 ms |
-| **Speedup, interpreter to x86-64** | **2.9x** |
-| **Speedup, VM to x86-64** | **2.9x** |
+| Tree-walking interpreter | 176 ms |
+| Bytecode VM | 155 ms |
+| Compiled x86-64 | 48 ms |
+| **Speedup, interpreter to x86-64** | **3.7x** |
+| **Speedup, VM to x86-64** | **3.2x** |
 
 The compiled path is faster because control flow, variable access, and the
 calling convention are all native. The VM comes out roughly even with the

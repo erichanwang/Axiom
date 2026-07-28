@@ -1,0 +1,10 @@
+# String-concatenation-heavy workload for benchmark.sh: builds up a long
+# string through repeated '+' concatenation, which forces the non-numeric
+# path in rt_arith/evalArith rather than the arithmetic fast path.
+s = ""
+i = 0
+while (i < 8000) {
+  s = s + "x"
+  i = i + 1
+}
+prt i

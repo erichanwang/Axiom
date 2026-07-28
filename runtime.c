@@ -26,26 +26,49 @@ typedef struct Value {
 static char* arena_next = NULL;
 static size_t arena_left = 0;
 
-static Value* alloc_value(void) {
-    if (arena_left < sizeof(Value)) {
-        arena_next = (char*)malloc(ARENA_CHUNK);
+// General bump allocator, backing both Value structs and the string bytes
+// they own. Strings get the same "never freed, lives until exit" treatment
+// as Values (see comment above), so a malloc/strdup per concatenation was
+// paying full allocator overhead for memory that's never returned anyway.
+// Oversized requests (bigger than a chunk) get their own dedicated chunk.
+static void* arena_alloc(size_t n) {
+    n = (n + 7) & ~(size_t)7;  // round up to keep the next allocation aligned
+    if (arena_left < n) {
+        size_t chunk_size = n > ARENA_CHUNK ? n : ARENA_CHUNK;
+        arena_next = (char*)malloc(chunk_size);
         if (!arena_next) {
             fprintf(stderr, "out of memory\n");
             exit(1);
         }
-        arena_left = ARENA_CHUNK;
+        arena_left = chunk_size;
     }
-    Value* v = (Value*)arena_next;
-    // sizeof(Value) is a multiple of 8 and malloc hands back 16-aligned
-    // blocks, so bumping by it keeps every Value aligned for its double.
-    arena_next += sizeof(Value);
-    arena_left -= sizeof(Value);
+    void* p = arena_next;
+    arena_next += n;
+    arena_left -= n;
+    return p;
+}
+
+static Value* alloc_value(void) {
+    Value* v = (Value*)arena_alloc(sizeof(Value));
     v->type = 0;      // matches calloc: VT_STRING is 0, overwritten by callers
     v->num = 0;
     v->str = NULL;
     v->arr = NULL;
     v->arr_len = 0;
     return v;
+}
+
+// Copies `s` into arena-owned memory. Same lifetime story as alloc_value:
+// never freed individually, so a bump allocation replaces malloc+strdup's
+// allocator round trip. Optionally hands back the length it already computed
+// via strlen, so callers that need it (to cache in Value::arr_len) don't
+// have to re-scan the string.
+static char* arena_strdup(const char* s, size_t* out_len) {
+    size_t len = s ? strlen(s) : 0;
+    char* copy = (char*)arena_alloc(len + 1);
+    memcpy(copy, s ? s : "", len + 1);
+    if (out_len) *out_len = len;
+    return copy;
 }
 
 Value* rt_make_num(double n) {
@@ -58,7 +81,11 @@ Value* rt_make_num(double n) {
 Value* rt_make_str(const char* s) {
     Value* v = alloc_value();
     v->type = VT_STRING;
-    v->str = strdup(s ? s : "");
+    size_t len;
+    v->str = arena_strdup(s, &len);
+    // Cache the length in arr_len (unused by STRING values otherwise) so
+    // rt_arith's concat path can skip re-scanning this string with strlen.
+    v->arr_len = (long)len;
     return v;
 }
 
@@ -72,7 +99,7 @@ Value* rt_make_bool(int b) {
 Value* rt_make_err(const char* msg) {
     Value* v = alloc_value();
     v->type = VT_ERROR;
-    v->str = strdup(msg ? msg : "");
+    v->str = arena_strdup(msg, NULL);
     return v;
 }
 
@@ -177,12 +204,26 @@ Value* rt_arith(int op, Value* left, Value* right) {
         char lb[256], rb[256];
         const char* ls = value_to_string(left, lb, sizeof(lb));
         const char* rs = value_to_string(right, rb, sizeof(rb));
-        char* joined = (char*)malloc(strlen(ls) + strlen(rs) + 1);
-        strcpy(joined, ls);
-        strcat(joined, rs);
+        // memcpy with the lengths already in hand, rather than strcpy+strcat:
+        // strcat would re-scan `joined` for its length even though we just
+        // computed it, an O(len(ls)) redundant scan on every concatenation.
+        // Arena-allocated rather than malloc'd: this string is never freed
+        // (see arena comment above), so a bump allocation replaces a full
+        // malloc round trip on the hottest path in string-heavy code.
+        // Lengths come from the cached arr_len when an operand is already a
+        // STRING Value, instead of strlen: a repeated "s = s + x" loop would
+        // otherwise re-scan the whole accumulated string on every iteration,
+        // turning one O(n) scan into an O(n^2) one over the loop.
+        size_t llen = (left && left->type == VT_STRING) ? (size_t)left->arr_len : strlen(ls);
+        size_t rlen = (right && right->type == VT_STRING) ? (size_t)right->arr_len : strlen(rs);
+        char* joined = (char*)arena_alloc(llen + rlen + 1);
+        memcpy(joined, ls, llen);
+        memcpy(joined + llen, rs, rlen);
+        joined[llen + rlen] = '\0';
         Value* v = alloc_value();
         v->type = VT_STRING;
         v->str = joined;
+        v->arr_len = (long)(llen + rlen);  // cache for the next link in the chain
         return v;
     }
     if (!both_numbers) return rt_make_err("non-numeric operand");

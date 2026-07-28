@@ -1250,6 +1250,7 @@ struct CodeGen {
     string returnLabel;
     bool regallocEnabled = true;
     bool peepholeEnabled = true;
+    bool constFoldEnabled = true;
 
     bool tempInUse[kNumTempRegs] = {false, false, false, false, false};
     bool tempEverUsed[kNumTempRegs] = {false, false, false, false, false};
@@ -1382,6 +1383,24 @@ struct CodeGen {
             case ExprKind::BINOP: {
                 if (e->str == "and" || e->str == "or") {
                     genShortCircuit(e);
+                    return;
+                }
+                // Constant folding: two literal numbers combined with +, -, or *
+                // have a result that is fully determined at compile time, so emit
+                // one rt_make_num call for the folded value instead of two for the
+                // operands plus a call to rt_arith. Division and modulo are left
+                // alone -- folding a by-zero case would have to reproduce the
+                // "ERROR: division by zero" Value rather than a plain double, and
+                // that's not worth the risk of drifting from rt_arith's behavior.
+                if (constFoldEnabled && e->left->kind == ExprKind::NUMBER &&
+                    e->right->kind == ExprKind::NUMBER &&
+                    (e->str == "+" || e->str == "-" || e->str == "*")) {
+                    double l = e->left->num, r = e->right->num;
+                    double folded = (e->str == "+") ? l + r : (e->str == "-") ? l - r : l * r;
+                    string lbl = ".LCnum" + std::to_string(litCounter++);
+                    rodata << lbl << ": .double " << folded << "\n";
+                    *text << "    movsd " << lbl << "(%rip), %xmm0\n";
+                    *text << "    call rt_make_num\n";
                     return;
                 }
                 int t = genAndHold(e->left.get());
@@ -1786,6 +1805,7 @@ int main(int argc, char* argv[]) {
     Mode mode = Mode::INTERPRET;
     bool regalloc = true;
     bool peephole = true;
+    bool constfold = true;
     string srcPath, outPath;
 
     for (size_t i = 0; i < args.size(); i++) {
@@ -1794,13 +1814,14 @@ int main(int argc, char* argv[]) {
         else if (args[i] == "--vm") mode = Mode::VM;
         else if (args[i] == "--no-regalloc") regalloc = false;
         else if (args[i] == "--no-peephole") peephole = false;
+        else if (args[i] == "--no-constfold") constfold = false;
         else if (args[i] == "-o" && i + 1 < args.size()) outPath = args[++i];
         else if (srcPath.empty()) srcPath = args[i];
     }
 
     if (srcPath.empty()) {
         cerr << "Usage: " << argv[0]
-             << " [--interpret|--vm|--compile] [--no-regalloc] [--no-peephole] <source_file.lang> [-o output.s]" << endl;
+             << " [--interpret|--vm|--compile] [--no-regalloc] [--no-peephole] [--no-constfold] <source_file.lang> [-o output.s]" << endl;
         return 1;
     }
 
@@ -1821,6 +1842,7 @@ int main(int argc, char* argv[]) {
         CodeGen cg;
         cg.regallocEnabled = regalloc;
         cg.peepholeEnabled = peephole;
+        cg.constFoldEnabled = constfold;
         string asmOut = cg.generate(prog);
         ofstream out(outPath);
         out << asmOut;

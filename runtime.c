@@ -11,9 +11,12 @@ typedef enum { VT_STRING, VT_NUMBER, VT_BOOL, VT_EMPTY, VT_ERROR, VT_ARRAY } Val
 typedef struct Value {
     ValueType type;
     double num;
-    char* str;
-    struct Value** arr;   // VT_ARRAY: element slots
-    long arr_len;         // VT_ARRAY: element count
+    char* str;             // VT_STRING leaf: the bytes. Lazy concat node: NULL
+                            // until rope_flatten() materializes and caches it.
+    struct Value** arr;    // VT_ARRAY: element slots.
+                            // VT_STRING lazy concat node (str == NULL): arr[0]/arr[1]
+                            // are the left/right operands (see rope_flatten).
+    long arr_len;          // VT_ARRAY: element count. VT_STRING: cached total length.
 } Value;
 
 // Values are never individually freed: the language has no destructor, no
@@ -105,6 +108,36 @@ Value* rt_make_err(const char* msg) {
 
 static const char* value_to_string(Value* v, char* buf, size_t bufsize);
 
+// Materializes a lazy string-concat node's bytes and caches them into v->str,
+// so a repeated read (e.g. printing the same value twice) doesn't re-walk the
+// tree. Traversal is iterative (an explicit heap stack, not C recursion)
+// because a `s = s + x` loop builds a left-leaning chain as deep as the loop
+// is long, and that easily exceeds a safe C stack depth.
+// Pushes right-then-left so leaves pop, and get appended, left-to-right.
+static char* rope_flatten(Value* v) {
+    size_t total = (size_t)v->arr_len;
+    char* out = (char*)arena_alloc(total + 1);
+    size_t cap = 64, n = 0, pos = 0;
+    Value** stack = (Value**)malloc(cap * sizeof(Value*));
+    stack[n++] = v;
+    while (n > 0) {
+        Value* cur = stack[--n];
+        if (cur->str) {
+            size_t len = (size_t)cur->arr_len;
+            memcpy(out + pos, cur->str, len);
+            pos += len;
+        } else {
+            if (n + 2 > cap) { cap *= 2; stack = (Value**)realloc(stack, cap * sizeof(Value*)); }
+            stack[n++] = cur->arr[1];
+            stack[n++] = cur->arr[0];
+        }
+    }
+    free(stack);
+    out[total] = '\0';
+    v->str = out;   // memoize: future reads of this exact node are O(1)
+    return v->str;
+}
+
 // Appends `s` to a growable heap buffer, doubling capacity as needed.
 static void str_append(char** buf, size_t* cap, size_t* len, const char* s) {
     size_t slen = strlen(s);
@@ -137,7 +170,7 @@ static char* array_to_string(Value* v) {
 static const char* value_to_string(Value* v, char* buf, size_t bufsize) {
     if (!v) return "EMPTY";
     switch (v->type) {
-        case VT_STRING: return v->str ? v->str : "";
+        case VT_STRING: return v->str ? v->str : rope_flatten(v);
         case VT_NUMBER: snprintf(buf, bufsize, "%.6f", v->num); return buf;
         case VT_BOOL: return v->num != 0 ? "true" : "false";
         case VT_ERROR: snprintf(buf, bufsize, "ERROR: %s", v->str ? v->str : ""); return buf;
@@ -201,29 +234,44 @@ Value* rt_arith(int op, Value* left, Value* right) {
     int both_numbers = left && right && left->type == VT_NUMBER && right->type == VT_NUMBER;
 
     if (op == 0 && !both_numbers) {   // '+' on anything but two numbers concatenates
-        char lb[256], rb[256];
-        const char* ls = value_to_string(left, lb, sizeof(lb));
-        const char* rs = value_to_string(right, rb, sizeof(rb));
-        // memcpy with the lengths already in hand, rather than strcpy+strcat:
-        // strcat would re-scan `joined` for its length even though we just
-        // computed it, an O(len(ls)) redundant scan on every concatenation.
-        // Arena-allocated rather than malloc'd: this string is never freed
-        // (see arena comment above), so a bump allocation replaces a full
-        // malloc round trip on the hottest path in string-heavy code.
-        // Lengths come from the cached arr_len when an operand is already a
-        // STRING Value, instead of strlen: a repeated "s = s + x" loop would
-        // otherwise re-scan the whole accumulated string on every iteration,
-        // turning one O(n) scan into an O(n^2) one over the loop.
-        size_t llen = (left && left->type == VT_STRING) ? (size_t)left->arr_len : strlen(ls);
-        size_t rlen = (right && right->type == VT_STRING) ? (size_t)right->arr_len : strlen(rs);
-        char* joined = (char*)arena_alloc(llen + rlen + 1);
-        memcpy(joined, ls, llen);
-        memcpy(joined + llen, rs, rlen);
-        joined[llen + rlen] = '\0';
+        // Builds a lazy two-child node (a rope) instead of copying both
+        // operands' bytes into a fresh buffer. A "s = s + x" loop was
+        // previously copying the whole accumulated string on every
+        // iteration -- O(n) work n times over, O(n^2) total. Recording the
+        // operand pair is O(1); the actual bytes are only materialized once,
+        // by rope_flatten, the first time the string is actually read
+        // (printed or compared). Total flatten cost across the value's
+        // lifetime is O(n) however many times "+" built up to it, since a
+        // flattened result is cached back into v->str.
+        // Non-STRING operands (numbers, bools, etc.) are stringified once
+        // into their own leaf node up front, same as before.
+        Value* lchild;
+        size_t llen;
+        if (left && left->type == VT_STRING) {
+            lchild = left;
+            llen = (size_t)left->arr_len;
+        } else {
+            char lb[256];
+            lchild = rt_make_str(value_to_string(left, lb, sizeof(lb)));
+            llen = (size_t)lchild->arr_len;
+        }
+        Value* rchild;
+        size_t rlen;
+        if (right && right->type == VT_STRING) {
+            rchild = right;
+            rlen = (size_t)right->arr_len;
+        } else {
+            char rb[256];
+            rchild = rt_make_str(value_to_string(right, rb, sizeof(rb)));
+            rlen = (size_t)rchild->arr_len;
+        }
         Value* v = alloc_value();
         v->type = VT_STRING;
-        v->str = joined;
-        v->arr_len = (long)(llen + rlen);  // cache for the next link in the chain
+        v->str = NULL;
+        v->arr = (Value**)arena_alloc(2 * sizeof(Value*));
+        v->arr[0] = lchild;
+        v->arr[1] = rchild;
+        v->arr_len = (long)(llen + rlen);
         return v;
     }
     if (!both_numbers) return rt_make_err("non-numeric operand");

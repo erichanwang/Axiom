@@ -572,6 +572,23 @@ static bool isArith(const string& op) {
     return op == "+" || op == "-" || op == "*" || op == "/" || op == "%";
 }
 
+// Bottom-up constant folding: true only when `e` is built entirely out of
+// NUMBER literals combined with +, -, * (recursing into both operands of
+// every such BINOP). Division, modulo, identifiers, calls, strings, unary,
+// comparisons, and "and"/"or" all bail out immediately -- this only ever
+// walks compile-time-constant numeric-literal trees, so folding its result
+// is always type-safe (never masks a string operand or a would-be type
+// error the way folding a variable operand could).
+static bool constEval(const Expr* e, double* out) {
+    if (e->kind == ExprKind::NUMBER) { *out = e->num; return true; }
+    if (e->kind != ExprKind::BINOP) return false;
+    if (e->str != "+" && e->str != "-" && e->str != "*") return false;
+    double l, r;
+    if (!constEval(e->left.get(), &l) || !constEval(e->right.get(), &r)) return false;
+    *out = (e->str == "+") ? l + r : (e->str == "-") ? l - r : l * r;
+    return true;
+}
+
 // Non-local exits out of a block, checked by the statement loop.
 enum class Flow { NORMAL, BREAK, CONTINUE, RETURN };
 
@@ -1385,23 +1402,44 @@ struct CodeGen {
                     genShortCircuit(e);
                     return;
                 }
-                // Constant folding: two literal numbers combined with +, -, or *
-                // have a result that is fully determined at compile time, so emit
-                // one rt_make_num call for the folded value instead of two for the
-                // operands plus a call to rt_arith. Division and modulo are left
-                // alone -- folding a by-zero case would have to reproduce the
-                // "ERROR: division by zero" Value rather than a plain double, and
-                // that's not worth the risk of drifting from rt_arith's behavior.
-                if (constFoldEnabled && e->left->kind == ExprKind::NUMBER &&
-                    e->right->kind == ExprKind::NUMBER &&
-                    (e->str == "+" || e->str == "-" || e->str == "*")) {
-                    double l = e->left->num, r = e->right->num;
-                    double folded = (e->str == "+") ? l + r : (e->str == "-") ? l - r : l * r;
-                    string lbl = ".LCnum" + std::to_string(litCounter++);
-                    rodata << lbl << ": .double " << folded << "\n";
-                    *text << "    movsd " << lbl << "(%rip), %xmm0\n";
-                    *text << "    call rt_make_num\n";
-                    return;
+                // Constant folding: an operand tree built entirely of NUMBER
+                // literals combined with +, -, * has a result fully determined
+                // at compile time (see constEval) -- this catches nested cases
+                // like (1+2)*3, not just an immediate NUMBER op NUMBER. Division
+                // and modulo are left alone -- folding a by-zero case would have
+                // to reproduce the "ERROR: division by zero" Value rather than a
+                // plain double, and that's not worth the risk of drifting from
+                // rt_arith's behavior.
+                //
+                // A comparison between two such constant trees is just as safe
+                // to fold (both sides are still numbers-only, never a string),
+                // and rt_cmp's numeric-both branch reduces to a plain bool, so
+                // the fold reproduces it exactly via the same rt_make_bool call
+                // genShortCircuit already uses for a compile-time-known bool.
+                double lc, rc;
+                if (constFoldEnabled && constEval(e->left.get(), &lc) && constEval(e->right.get(), &rc)) {
+                    if (e->str == "+" || e->str == "-" || e->str == "*") {
+                        double folded = (e->str == "+") ? lc + rc : (e->str == "-") ? lc - rc : lc * rc;
+                        string lbl = ".LCnum" + std::to_string(litCounter++);
+                        rodata << lbl << ": .double " << folded << "\n";
+                        *text << "    movsd " << lbl << "(%rip), %xmm0\n";
+                        *text << "    call rt_make_num\n";
+                        return;
+                    }
+                    if (!isArith(e->str)) {   // comparison op
+                        bool b;
+                        if (e->str == "==") b = lc == rc;
+                        else if (e->str == "!=") b = lc != rc;
+                        else if (e->str == ">") b = lc > rc;
+                        else if (e->str == "<") b = lc < rc;
+                        else if (e->str == ">=") b = lc >= rc;
+                        else b = lc <= rc; // "<="
+                        *text << "    mov $" << (b ? 1 : 0) << ", %edi\n";
+                        *text << "    call rt_make_bool\n";
+                        return;
+                    }
+                    // '/' or '%': fall through to rt_arith so a divide-by-zero
+                    // still produces rt_arith's exact error Value.
                 }
                 int t = genAndHold(e->left.get());
                 genExpr(e->right.get());
@@ -1672,10 +1710,10 @@ struct CodeGen {
         localSlots.clear();
     }
 
-    // Two local, structurally-safe cleanups over the emitted instruction
-    // stream, applied after codegen rather than threaded through it, so each
-    // is a small independent pass instead of another thing every emit site
-    // has to remember:
+    // Local, structurally-safe cleanups over the emitted instruction stream,
+    // applied after codegen rather than threaded through it, so each is a
+    // small independent pass instead of another thing every emit site has
+    // to remember:
     //
     //   1. An unconditional jmp makes every instruction after it (up to the
     //      next label) unreachable. genBlock leaves some of these behind --
@@ -1684,7 +1722,15 @@ struct CodeGen {
     //      this codegen, so "jmp immediately followed by another jmp" can
     //      only happen when the second jmp has no label pointing at it,
     //      which makes deleting it always safe.
-    //   2. `mov A, B` immediately followed by `mov B, A` reloads a value
+    //   2. `jmp .Lxxx` immediately followed by the label `.Lxxx:` itself is
+    //      a jump to the very next instruction -- falls through to it
+    //      anyway, so the jmp is a no-op regardless of what else jumps into
+    //      it (any such edge lands on the jmp, which was just about to
+    //      transfer to that same next line). genStmt's IF case leaves this
+    //      behind on every "if" with no else/else-if: the branch body ends
+    //      with `jmp end`, and since no further branch needs a mid-chain
+    //      label, `end:` is the very next line.
+    //   3. `mov A, B` immediately followed by `mov B, A` reloads a value
     //      that is already sitting where it's being loaded to. Nothing can
     //      have touched A or B between two adjacent lines, so the reload is
     //      always redundant.
@@ -1704,6 +1750,20 @@ struct CodeGen {
         auto jmpTarget = [&](const string& l) -> bool {
             return trimmed(l).rfind("jmp ", 0) == 0;
         };
+        // Extracts the label name out of a "jmp .Lxxx" line, or "" if the
+        // line isn't a jmp.
+        auto jmpLabel = [&](const string& l) -> string {
+            string t = trimmed(l);
+            if (t.rfind("jmp ", 0) != 0) return "";
+            return trimmed(t.substr(4));
+        };
+        // True when `l` is exactly the label-definition line for `name`
+        // (labels are always their own line, with no leading indentation,
+        // per this codegen's emit sites).
+        auto isLabelLine = [&](const string& l, const string& name) -> bool {
+            string t = trimmed(l);
+            return !t.empty() && t.back() == ':' && t.substr(0, t.size() - 1) == name;
+        };
         auto movOperands = [&](const string& l, string& a, string& b) -> bool {
             string t = trimmed(l);
             if (t.rfind("mov ", 0) != 0) return false;
@@ -1719,6 +1779,11 @@ struct CodeGen {
         int deleted = 0;
         for (size_t i = 0; i < lines.size(); i++) {
             if (jmpTarget(lines[i])) {
+                string tgt = jmpLabel(lines[i]);
+                if (!tgt.empty() && i + 1 < lines.size() && isLabelLine(lines[i + 1], tgt)) {
+                    deleted++;   // jump-to-next: drop the jmp, keep the label
+                    continue;
+                }
                 out.push_back(lines[i]);
                 size_t j = i + 1;
                 while (j < lines.size() && jmpTarget(lines[j])) { deleted++; j++; }

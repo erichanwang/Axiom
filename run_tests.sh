@@ -41,6 +41,15 @@ for f in *.lang; do
         diff "$BUILD/$name.interp.out" "$BUILD/$name.asm.out"
         ok=0
     fi
+    # Direct vm-vs-asm check: the two checks above already make this pass
+    # transitively whenever both hold, but a direct diff is what "all three
+    # backends agree" actually means, and it stays meaningful even if one of
+    # the interpreter comparisons above is ever weakened or reordered.
+    if ! diff -q "$BUILD/$name.vm.out" "$BUILD/$name.asm.out" > /dev/null; then
+        echo "FAIL (vm vs x86 mismatch): $f"
+        diff "$BUILD/$name.vm.out" "$BUILD/$name.asm.out"
+        ok=0
+    fi
     if [ $ok -eq 1 ]; then
         echo "OK:   $f"
     else

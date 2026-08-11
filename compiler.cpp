@@ -572,6 +572,23 @@ static bool isArith(const string& op) {
     return op == "+" || op == "-" || op == "*" || op == "/" || op == "%";
 }
 
+// Bottom-up constant folding: true only when `e` is built entirely out of
+// NUMBER literals combined with +, -, * (recursing into both operands of
+// every such BINOP). Division, modulo, identifiers, calls, strings, unary,
+// comparisons, and "and"/"or" all bail out immediately -- this only ever
+// walks compile-time-constant numeric-literal trees, so folding its result
+// is always type-safe (never masks a string operand or a would-be type
+// error the way folding a variable operand could).
+static bool constEval(const Expr* e, double* out) {
+    if (e->kind == ExprKind::NUMBER) { *out = e->num; return true; }
+    if (e->kind != ExprKind::BINOP) return false;
+    if (e->str != "+" && e->str != "-" && e->str != "*") return false;
+    double l, r;
+    if (!constEval(e->left.get(), &l) || !constEval(e->right.get(), &r)) return false;
+    *out = (e->str == "+") ? l + r : (e->str == "-") ? l - r : l * r;
+    return true;
+}
+
 // Non-local exits out of a block, checked by the statement loop.
 enum class Flow { NORMAL, BREAK, CONTINUE, RETURN };
 
@@ -1249,6 +1266,8 @@ struct CodeGen {
     vector<LoopLabels> loopStack;
     string returnLabel;
     bool regallocEnabled = true;
+    bool peepholeEnabled = true;
+    bool constFoldEnabled = true;
 
     bool tempInUse[kNumTempRegs] = {false, false, false, false, false};
     bool tempEverUsed[kNumTempRegs] = {false, false, false, false, false};
@@ -1382,6 +1401,45 @@ struct CodeGen {
                 if (e->str == "and" || e->str == "or") {
                     genShortCircuit(e);
                     return;
+                }
+                // Constant folding: an operand tree built entirely of NUMBER
+                // literals combined with +, -, * has a result fully determined
+                // at compile time (see constEval) -- this catches nested cases
+                // like (1+2)*3, not just an immediate NUMBER op NUMBER. Division
+                // and modulo are left alone -- folding a by-zero case would have
+                // to reproduce the "ERROR: division by zero" Value rather than a
+                // plain double, and that's not worth the risk of drifting from
+                // rt_arith's behavior.
+                //
+                // A comparison between two such constant trees is just as safe
+                // to fold (both sides are still numbers-only, never a string),
+                // and rt_cmp's numeric-both branch reduces to a plain bool, so
+                // the fold reproduces it exactly via the same rt_make_bool call
+                // genShortCircuit already uses for a compile-time-known bool.
+                double lc, rc;
+                if (constFoldEnabled && constEval(e->left.get(), &lc) && constEval(e->right.get(), &rc)) {
+                    if (e->str == "+" || e->str == "-" || e->str == "*") {
+                        double folded = (e->str == "+") ? lc + rc : (e->str == "-") ? lc - rc : lc * rc;
+                        string lbl = ".LCnum" + std::to_string(litCounter++);
+                        rodata << lbl << ": .double " << folded << "\n";
+                        *text << "    movsd " << lbl << "(%rip), %xmm0\n";
+                        *text << "    call rt_make_num\n";
+                        return;
+                    }
+                    if (!isArith(e->str)) {   // comparison op
+                        bool b;
+                        if (e->str == "==") b = lc == rc;
+                        else if (e->str == "!=") b = lc != rc;
+                        else if (e->str == ">") b = lc > rc;
+                        else if (e->str == "<") b = lc < rc;
+                        else if (e->str == ">=") b = lc >= rc;
+                        else b = lc <= rc; // "<="
+                        *text << "    mov $" << (b ? 1 : 0) << ", %edi\n";
+                        *text << "    call rt_make_bool\n";
+                        return;
+                    }
+                    // '/' or '%': fall through to rt_arith so a divide-by-zero
+                    // still produces rt_arith's exact error Value.
                 }
                 int t = genAndHold(e->left.get());
                 genExpr(e->right.get());
@@ -1652,6 +1710,102 @@ struct CodeGen {
         localSlots.clear();
     }
 
+    // Local, structurally-safe cleanups over the emitted instruction stream,
+    // applied after codegen rather than threaded through it, so each is a
+    // small independent pass instead of another thing every emit site has
+    // to remember:
+    //
+    //   1. An unconditional jmp makes every instruction after it (up to the
+    //      next label) unreachable. genBlock leaves some of these behind --
+    //      e.g. an explicit early return followed by the fall-through jump
+    //      to the same block's end. Labels are always their own line in
+    //      this codegen, so "jmp immediately followed by another jmp" can
+    //      only happen when the second jmp has no label pointing at it,
+    //      which makes deleting it always safe.
+    //   2. `jmp .Lxxx` immediately followed by the label `.Lxxx:` itself is
+    //      a jump to the very next instruction -- falls through to it
+    //      anyway, so the jmp is a no-op regardless of what else jumps into
+    //      it (any such edge lands on the jmp, which was just about to
+    //      transfer to that same next line). genStmt's IF case leaves this
+    //      behind on every "if" with no else/else-if: the branch body ends
+    //      with `jmp end`, and since no further branch needs a mid-chain
+    //      label, `end:` is the very next line.
+    //   3. `mov A, B` immediately followed by `mov B, A` reloads a value
+    //      that is already sitting where it's being loaded to. Nothing can
+    //      have touched A or B between two adjacent lines, so the reload is
+    //      always redundant.
+    //
+    // Returns the optimized text; *removed is set to the instruction count
+    // deleted, which is what benchmark.sh reports.
+    static string peephole(const string& asmText, int* removed) {
+        vector<string> lines;
+        istringstream iss(asmText);
+        string line;
+        while (getline(iss, line)) lines.push_back(line);
+
+        auto trimmed = [](const string& l) {
+            size_t p = l.find_first_not_of(" \t");
+            return p == string::npos ? string() : l.substr(p);
+        };
+        auto jmpTarget = [&](const string& l) -> bool {
+            return trimmed(l).rfind("jmp ", 0) == 0;
+        };
+        // Extracts the label name out of a "jmp .Lxxx" line, or "" if the
+        // line isn't a jmp.
+        auto jmpLabel = [&](const string& l) -> string {
+            string t = trimmed(l);
+            if (t.rfind("jmp ", 0) != 0) return "";
+            return trimmed(t.substr(4));
+        };
+        // True when `l` is exactly the label-definition line for `name`
+        // (labels are always their own line, with no leading indentation,
+        // per this codegen's emit sites).
+        auto isLabelLine = [&](const string& l, const string& name) -> bool {
+            string t = trimmed(l);
+            return !t.empty() && t.back() == ':' && t.substr(0, t.size() - 1) == name;
+        };
+        auto movOperands = [&](const string& l, string& a, string& b) -> bool {
+            string t = trimmed(l);
+            if (t.rfind("mov ", 0) != 0) return false;
+            string rest = t.substr(4);
+            size_t comma = rest.find(',');
+            if (comma == string::npos) return false;
+            a = rest.substr(0, comma);
+            b = trimmed(rest.substr(comma + 1));
+            return true;
+        };
+
+        vector<string> out;
+        int deleted = 0;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (jmpTarget(lines[i])) {
+                string tgt = jmpLabel(lines[i]);
+                if (!tgt.empty() && i + 1 < lines.size() && isLabelLine(lines[i + 1], tgt)) {
+                    deleted++;   // jump-to-next: drop the jmp, keep the label
+                    continue;
+                }
+                out.push_back(lines[i]);
+                size_t j = i + 1;
+                while (j < lines.size() && jmpTarget(lines[j])) { deleted++; j++; }
+                i = j - 1;
+                continue;
+            }
+            string a, b, a2, b2;
+            if (i + 1 < lines.size() && movOperands(lines[i], a, b) &&
+                movOperands(lines[i + 1], a2, b2) && a2 == b && b2 == a) {
+                out.push_back(lines[i]);
+                deleted++;
+                i++;
+                continue;
+            }
+            out.push_back(lines[i]);
+        }
+        if (removed) *removed = deleted;
+        ostringstream res;
+        for (auto& l : out) res << l << "\n";
+        return res.str();
+    }
+
     string generate(const Program& prog) {
         for (auto& s : prog)
             if (s->kind == StmtKind::FUNC) knownFuncs.insert(s->name);
@@ -1663,6 +1817,15 @@ struct CodeGen {
         text = &mainText;
         genBlock(prog);
         string mainBody = frameWrap("main", mainText.str(), 0, {}, returnLabel, tempEverUsed, true);
+
+        if (peepholeEnabled) {
+            int removed = 0;
+            string funcsOpt = peephole(funcs.str(), &removed);
+            int removed2 = 0;
+            mainBody = peephole(mainBody, &removed2);
+            funcs.str("");
+            funcs << funcsOpt;
+        }
 
         ostringstream out;
         out << "    .extern rt_make_num\n"
@@ -1706,6 +1869,8 @@ int main(int argc, char* argv[]) {
     enum class Mode { INTERPRET, COMPILE, VM };
     Mode mode = Mode::INTERPRET;
     bool regalloc = true;
+    bool peephole = true;
+    bool constfold = true;
     string srcPath, outPath;
 
     for (size_t i = 0; i < args.size(); i++) {
@@ -1713,13 +1878,15 @@ int main(int argc, char* argv[]) {
         else if (args[i] == "--interpret") mode = Mode::INTERPRET;
         else if (args[i] == "--vm") mode = Mode::VM;
         else if (args[i] == "--no-regalloc") regalloc = false;
+        else if (args[i] == "--no-peephole") peephole = false;
+        else if (args[i] == "--no-constfold") constfold = false;
         else if (args[i] == "-o" && i + 1 < args.size()) outPath = args[++i];
         else if (srcPath.empty()) srcPath = args[i];
     }
 
     if (srcPath.empty()) {
         cerr << "Usage: " << argv[0]
-             << " [--interpret|--vm|--compile] [--no-regalloc] <source_file.lang> [-o output.s]" << endl;
+             << " [--interpret|--vm|--compile] [--no-regalloc] [--no-peephole] [--no-constfold] <source_file.lang> [-o output.s]" << endl;
         return 1;
     }
 
@@ -1739,6 +1906,8 @@ int main(int argc, char* argv[]) {
         if (outPath.empty()) outPath = srcPath + ".s";
         CodeGen cg;
         cg.regallocEnabled = regalloc;
+        cg.peepholeEnabled = peephole;
+        cg.constFoldEnabled = constfold;
         string asmOut = cg.generate(prog);
         ofstream out(outPath);
         out << asmOut;

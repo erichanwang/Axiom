@@ -527,13 +527,18 @@ struct Parser {
 
 // ===================== Interpreter =====================
 
-enum class ValueType { STRING, NUMBER, BOOL, EMPTY, ERROR };
+enum class ValueType { STRING, NUMBER, BOOL, EMPTY, ERROR, ARRAY };
 
 struct Value {
     ValueType type = ValueType::EMPTY;
     string s_val;
     double n_val = 0;
     bool b_val = false;
+    // Arrays are heap objects with reference semantics: copying a Value
+    // (assignment, passing as a call argument, storing an element) copies
+    // this shared_ptr, not the vector, so `b = a` aliases the same backing
+    // storage the same way the compiled backend's Value* pointer does.
+    shared_ptr<vector<Value>> arr_val;
 
     string to_string() const {
         switch (type) {
@@ -541,6 +546,15 @@ struct Value {
             case ValueType::NUMBER: return std::to_string(n_val);
             case ValueType::BOOL: return b_val ? "true" : "false";
             case ValueType::ERROR: return "ERROR: " + s_val;
+            case ValueType::ARRAY: {
+                string out = "[";
+                for (size_t i = 0; i < arr_val->size(); i++) {
+                    if (i) out += ", ";
+                    out += (*arr_val)[i].to_string();
+                }
+                out += "]";
+                return out;
+            }
             default: return "EMPTY";
         }
     }
@@ -587,6 +601,19 @@ struct Interpreter {
 
     static Value makeErr(const string& msg) {
         Value v; v.type = ValueType::ERROR; v.s_val = msg; return v;
+    }
+
+    // Mirrors rt_array_get in runtime.c exactly, including check order:
+    // propagate errors first, then type-check the base and the index, then
+    // bounds-check. See the semantics note above runtime.c's array section.
+    static Value arrayIndex(const Value& base, const Value& idx) {
+        if (base.type == ValueType::ERROR) return base;
+        if (idx.type == ValueType::ERROR) return idx;
+        if (base.type != ValueType::ARRAY) return makeErr("not an array");
+        if (idx.type != ValueType::NUMBER) return makeErr("non-numeric index");
+        long i = (long)idx.n_val;
+        if (i < 0 || i >= (long)base.arr_val->size()) return makeErr("index out of bounds");
+        return (*base.arr_val)[i];
     }
 
     Value evalArith(const string& op, const Value& l, const Value& r) {
@@ -653,10 +680,29 @@ struct Interpreter {
                 return v;
             }
             case ExprKind::CALL: {
+                // `len` is a reserved builtin, not a user function: it is
+                // intercepted here before any lookup in `functions`, so a
+                // program cannot define its own `len`.
+                if (e->str == "len" && e->args.size() == 1) {
+                    Value arg = evalExpr(e->args[0].get());
+                    if (arg.type == ValueType::ERROR) return arg;
+                    if (arg.type != ValueType::ARRAY) return makeErr("not an array");
+                    Value result; result.type = ValueType::NUMBER;
+                    result.n_val = (double)arg.arr_val->size();
+                    return result;
+                }
                 vector<Value> args;
                 for (auto& a : e->args) args.push_back(evalExpr(a.get()));
                 return callFunction(e->str, args);
             }
+            case ExprKind::ARRAY: {
+                v.type = ValueType::ARRAY;
+                v.arr_val = make_shared<vector<Value>>();
+                for (auto& a : e->args) v.arr_val->push_back(evalExpr(a.get()));
+                return v;
+            }
+            case ExprKind::INDEX:
+                return arrayIndex(evalExpr(e->left.get()), evalExpr(e->right.get()));
             case ExprKind::BINOP: {
                 const string& op = e->str;
                 // Short-circuit: the right operand must not be evaluated at
@@ -735,6 +781,17 @@ struct Interpreter {
                 return Flow::RETURN;
             case StmtKind::BREAK:    return Flow::BREAK;
             case StmtKind::CONTINUE: return Flow::CONTINUE;
+            case StmtKind::INDEXSET: {
+                Value* target = lookup(s->indexTarget->str);
+                Value idxv = evalExpr(s->indexExpr.get());
+                Value val = evalExpr(s->expr.get());
+                if (!target || target->type != ValueType::ARRAY) return Flow::NORMAL;
+                if (idxv.type != ValueType::NUMBER) return Flow::NORMAL;
+                long i = (long)idxv.n_val;
+                if (i < 0 || i >= (long)target->arr_val->size()) return Flow::NORMAL;
+                (*target->arr_val)[i] = val;
+                return Flow::NORMAL;
+            }
             case StmtKind::WHILE: {
                 while (truthy(evalExpr(s->cond.get()))) {
                     Flow f = execBlock(s->body);
@@ -865,6 +922,13 @@ struct CodeGen {
         if (t >= 0) { *text << "    mov " << kTempRegs[t] << ", " << dest << "\n"; freeTemp(t); }
         else { *text << "    mov (%rsp), " << dest << "\n" << "    add $16, %rsp\n"; }
     }
+    // Like releaseInto, but keeps the value held -- for array-literal
+    // construction, which needs the same array pointer across every element
+    // store, not a one-shot consume.
+    void peekInto(int t, const char* dest) {
+        if (t >= 0) *text << "    mov " << kTempRegs[t] << ", " << dest << "\n";
+        else *text << "    mov (%rsp), " << dest << "\n";
+    }
 
     // Emits code that leaves a Value* result in %rax.
     void genExpr(const Expr* e) {
@@ -937,6 +1001,35 @@ struct CodeGen {
                 }
                 return;
             }
+            case ExprKind::ARRAY: {
+                // Allocate all n slots up front, then fill them one at a time.
+                // The array pointer is held across every element's evaluation
+                // (which may itself spill/call), same discipline as any other
+                // held temporary.
+                size_t n = e->args.size();
+                *text << "    mov $" << n << ", %edi\n";
+                *text << "    call rt_array_new\n";
+                int t = allocTemp();
+                if (t >= 0) *text << "    mov %rax, " << kTempRegs[t] << "\n";
+                else { *text << "    sub $16, %rsp\n" << "    mov %rax, (%rsp)\n"; }
+                for (size_t i = 0; i < n; i++) {
+                    genExpr(e->args[i].get());
+                    *text << "    mov %rax, %rdx\n";        // element value -> arg3
+                    peekInto(t, "%rdi");                     // array        -> arg1
+                    *text << "    mov $" << i << ", %esi\n"; // index        -> arg2
+                    *text << "    call rt_array_set_elem\n";
+                }
+                releaseInto(t, "%rax");
+                return;
+            }
+            case ExprKind::INDEX: {
+                int t = genAndHold(e->left.get());   // array
+                genExpr(e->right.get());              // index -> %rax
+                *text << "    mov %rax, %rsi\n";
+                releaseInto(t, "%rdi");
+                *text << "    call rt_array_get\n";
+                return;
+            }
         }
     }
 
@@ -965,6 +1058,14 @@ struct CodeGen {
     }
 
     void genCall(const Expr* e) {
+        // `len` is a reserved builtin, intercepted before the user-function
+        // checks below -- a program cannot declare its own `len`.
+        if (e->str == "len" && e->args.size() == 1) {
+            genExpr(e->args[0].get());
+            *text << "    mov %rax, %rdi\n";
+            *text << "    call rt_array_len\n";
+            return;
+        }
         size_t n = e->args.size();
         if (n > (size_t)kMaxArgs) {
             cerr << "Error: '" << e->str << "' called with " << n
@@ -1031,6 +1132,16 @@ struct CodeGen {
             case StmtKind::CALLSTMT:
                 genExpr(s->expr.get());
                 return;
+            case StmtKind::INDEXSET: {
+                int t1 = genAndHold(s->indexTarget.get());  // array
+                int t2 = genAndHold(s->indexExpr.get());    // index
+                genExpr(s->expr.get());                      // value -> %rax
+                *text << "    mov %rax, %rdx\n";
+                releaseInto(t2, "%rsi");
+                releaseInto(t1, "%rdi");
+                *text << "    call rt_array_set\n";
+                return;
+            }
             case StmtKind::RETURN:
                 if (s->expr) genExpr(s->expr.get());
                 else *text << "    xor %eax, %eax\n";
@@ -1169,6 +1280,11 @@ struct CodeGen {
             << "    .extern rt_undef\n"
             << "    .extern rt_truthy\n"
             << "    .extern rt_make_bool\n"
+            << "    .extern rt_array_new\n"
+            << "    .extern rt_array_set_elem\n"
+            << "    .extern rt_array_get\n"
+            << "    .extern rt_array_set\n"
+            << "    .extern rt_array_len\n"
             << "    .section .rodata\n"
             << rodata.str()
             << "    .section .bss\n"

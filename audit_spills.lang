@@ -1,0 +1,7 @@
+func value(x) {
+  prt x
+  return x
+}
+
+prt 1 - (2 - (3 - (4 - (5 - (6 - value(7))))))
+prt 1 + (2 + (3 + (4 + (5 + (6 + value(7))))))

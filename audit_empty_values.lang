@@ -1,0 +1,12 @@
+func empty() {
+  return
+}
+
+func show(value) {
+  prt value
+  return value
+}
+
+saved = empty()
+prt saved
+prt show(empty())

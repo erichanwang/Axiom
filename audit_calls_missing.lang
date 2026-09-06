@@ -1,0 +1,10 @@
+func six(a, b, c, d, e, f) {
+  prt a
+  prt b
+  prt c
+  prt d
+  prt e
+  prt f
+}
+
+six(1)

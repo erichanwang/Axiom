@@ -1,0 +1,17 @@
+func mark(x) {
+  prt x
+  return x
+}
+
+func six(a, b, c, d, e, f) {
+  prt a
+  prt b
+  prt c
+  prt d
+  prt e
+  prt f
+  return a + b + c + d + e + f
+}
+
+prt six(mark(1), mark(2), mark(3), mark(4), mark(5), mark(6))
+prt six(mark(mark(7)), mark(mark(8)), mark(mark(9)), mark(mark(10)), mark(mark(11)), mark(mark(12)))
